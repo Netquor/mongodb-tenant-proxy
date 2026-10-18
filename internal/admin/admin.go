@@ -4,6 +4,7 @@ package admin
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
@@ -15,9 +16,11 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/netquor/mongodb-tenant-proxy/internal/audit"
+	"github.com/netquor/mongodb-tenant-proxy/internal/auth"
 	"github.com/netquor/mongodb-tenant-proxy/internal/config"
 	"github.com/netquor/mongodb-tenant-proxy/internal/metrics"
 	"github.com/netquor/mongodb-tenant-proxy/internal/proxy"
@@ -35,6 +38,12 @@ type Backend interface {
 	Reload() (*proxy.ReloadResult, error)
 }
 
+// Timeouts against slow clients (variables so tests can shorten them).
+var (
+	readHeaderTimeout = 10 * time.Second
+	readTimeout       = 30 * time.Second
+)
+
 // Server is the admin HTTP API.
 type Server struct {
 	b     Backend
@@ -42,11 +51,46 @@ type Server struct {
 	mtls  bool
 	tlsc  *tls.Config
 	mux   *http.ServeMux
+
+	// failures locks out client addresses that keep presenting bad
+	// credentials; rate caps authenticated requests per second overall.
+	failures *auth.Throttle
+	rate     *rateLimiter
+}
+
+// rateLimiter is a token bucket (burst = 2x rate).
+type rateLimiter struct {
+	mu     sync.Mutex
+	rate   float64
+	tokens float64
+	last   time.Time
+}
+
+func (l *rateLimiter) allow() bool {
+	if l == nil {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	l.tokens = min(2*l.rate, l.tokens+now.Sub(l.last).Seconds()*l.rate)
+	l.last = now
+	if l.tokens < 1 {
+		return false
+	}
+	l.tokens--
+	return true
 }
 
 // New builds the API from config. It fails if no authentication is configured.
 func New(b Backend, cfg config.Admin) (*Server, error) {
-	s := &Server{b: b, mux: http.NewServeMux()}
+	s := &Server{b: b, mux: http.NewServeMux(), failures: auth.NewThrottle(10, time.Minute, time.Minute)}
+	switch r := cfg.RatePerSec; {
+	case r == 0:
+		s.rate = &rateLimiter{rate: 50, tokens: 100, last: time.Now()}
+	case r > 0:
+		s.rate = &rateLimiter{rate: r, tokens: 2 * r, last: time.Now()}
+	}
 	tok := cfg.Token
 	if cfg.TokenFile != "" {
 		raw, err := os.ReadFile(cfg.TokenFile)
@@ -62,7 +106,8 @@ func New(b Backend, cfg config.Admin) (*Server, error) {
 		if len(tok) < 16 {
 			return nil, errors.New("admin token must be at least 16 characters")
 		}
-		s.token = []byte(tok)
+		sum := sha256.Sum256([]byte(tok))
+		s.token = sum[:]
 	}
 	if t := cfg.TLS; t != nil {
 		cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
@@ -101,7 +146,14 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	if s.tlsc != nil {
 		ln = tls.NewListener(ln, s.tlsc)
 	}
-	hs := &http.Server{Handler: s.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	hs := &http.Server{
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout, // slow bodies
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    64 << 10,
+	}
 	go func() {
 		<-ctx.Done()
 		sc, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -126,8 +178,13 @@ func (s *Server) authenticate(r *http.Request) (string, bool) {
 	}
 	if s.token != nil {
 		h := r.Header.Get("Authorization")
-		if t, ok := strings.CutPrefix(h, "Bearer "); ok && subtle.ConstantTimeCompare([]byte(t), s.token) == 1 {
-			return "token", true
+		// Compare fixed-length digests so neither content nor length of the
+		// token leaks through timing.
+		if t, ok := strings.CutPrefix(h, "Bearer "); ok {
+			sum := sha256.Sum256([]byte(t))
+			if subtle.ConstantTimeCompare(sum[:], s.token) == 1 {
+				return "token", true
+			}
 		}
 	}
 	return "", false
@@ -140,11 +197,32 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "ok")
 		return
 	}
+	// The API is for programs. A browser attaches Origin (or Sec-Fetch-Site)
+	// to cross-site requests, and a browser holding a client certificate
+	// would authenticate them to this API by mTLS alone, so refuse any
+	// request that looks browser-initiated (CSRF).
+	if r.Header.Get("Origin") != "" || r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+		s.b.Audit().Log(audit.Event{Type: audit.AdminAction, Corr: id, Remote: r.RemoteAddr, Action: r.Method + " " + r.URL.Path, Outcome: "rejected", Reason: "browser-initiated request"})
+		writeJSON(w, 403, map[string]string{"error": "cross-origin requests are not allowed"})
+		return
+	}
+	ip := remoteHost(r.RemoteAddr)
+	if ok, wait := s.failures.Allowed(ip); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+		writeJSON(w, 429, map[string]string{"error": "too many failed authentication attempts"})
+		return
+	}
 	actor, ok := s.authenticate(r)
 	if !ok {
+		s.failures.Fail(ip)
 		s.b.Audit().Log(audit.Event{Type: audit.AdminAction, Corr: id, Remote: r.RemoteAddr, Action: r.Method + " " + r.URL.Path, Outcome: "unauthorized"})
 		w.Header().Set("WWW-Authenticate", `Bearer realm="mongodb-tenant-proxy"`)
 		writeJSON(w, 401, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !s.rate.allow() {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, 429, map[string]string{"error": "rate limit exceeded"})
 		return
 	}
 	r = r.WithContext(context.WithValue(r.Context(), reqKey, &reqInfo{actor: actor, id: id}))
@@ -181,6 +259,13 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
+func remoteHost(addr string) string {
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		return h
+	}
+	return addr
+}
+
 func fail(w http.ResponseWriter, err error) {
 	code := 500
 	switch {
@@ -191,7 +276,13 @@ func fail(w http.ResponseWriter, err error) {
 	case errors.Is(err, tenants.ErrInvalid):
 		code = 400
 	}
-	writeJSON(w, code, map[string]string{"error": err.Error()})
+	msg := err.Error()
+	if code == 500 {
+		// Store and driver errors can carry hostnames and connection
+		// details; the audit log has the full text.
+		msg = "internal error"
+	}
+	writeJSON(w, code, map[string]string{"error": msg})
 }
 
 func decode(r *http.Request, v any) error {

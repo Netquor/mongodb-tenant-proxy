@@ -43,9 +43,17 @@ type Server struct {
 	mu     sync.Mutex
 	conns  map[*conn]struct{}
 	tenant map[string]int
-	wg     sync.WaitGroup
-	fan    *fanout.Manager
-	views  viewCache
+	// Connection admission (all guarded by mu): open connections per client
+	// address and those that have not yet bound to a tenant.
+	ipConns   map[string]int
+	preauth   int
+	preauthIP map[string]int
+	// throttleIP / throttleUser lock out clients that keep failing to
+	// authenticate (nil = disabled).
+	throttleIP, throttleUser *auth.Throttle
+	wg                       sync.WaitGroup
+	fan                      *fanout.Manager
+	views                    viewCache
 	// dbStreams records databases that have been watched at database level;
 	// writes to their collections get pre/post images enabled first.
 	dbStreams sync.Map
@@ -82,6 +90,19 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		conns:  map[*conn]struct{}{},
 		tenant: map[string]int{},
 		lim:    limits.NewManager(cfg, nil),
+
+		ipConns:   map[string]int{},
+		preauthIP: map[string]int{},
+	}
+	if max, perUser, window, lockout := cfg.Auth.BruteForce.Effective(); max > 0 {
+		s.throttleIP = auth.NewThrottle(max, window, lockout)
+		s.throttleUser = auth.NewThrottle(perUser, window, lockout)
+	}
+	if cfg.Auth.Mode.Has("appname") && cfg.Auth.AppNameSecret == "" {
+		log.Warn("auth.mode=appname without auth.appNameSecret: any client can claim any tenant by naming it; use it only on a trusted network")
+	}
+	if cfg.Auth.Mode.Has("static") {
+		log.Warn("auth.mode=static: every client reaching the listener is the same tenant; restrict who can connect")
 	}
 	s.clientComp = map[wire.Compressor]bool{}
 	for _, n := range cfg.Compressors {
@@ -131,31 +152,123 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		<-ctx.Done()
 		ln.Close()
 	}()
+	var backoff time.Duration
 	for {
 		nc, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				s.shutdown()
 				return nil
 			}
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				continue
+			// Anything else (EMFILE under a connection flood, a reset
+			// connection that never completed) is a reason to wait and
+			// try again, never to stop serving every tenant.
+			backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
+			s.log.Warn("accept failed; retrying", "err", err, "in", backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
 			}
-			return err
+			continue
 		}
+		backoff = 0
 		c := newConn(s, nc)
-		s.mu.Lock()
-		s.conns[c] = struct{}{}
-		s.mu.Unlock()
+		if !s.admitConn(c) {
+			s.M.ConnsRejected.Add(1)
+			nc.Close()
+			continue
+		}
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
 			c.serve(ctx)
-			s.mu.Lock()
-			delete(s.conns, c)
-			s.mu.Unlock()
+			s.dropConn(c)
 		}()
+	}
+}
+
+// remoteIP returns the host part of a client address.
+func remoteIP(a net.Addr) string {
+	if a == nil {
+		return ""
+	}
+	if h, _, err := net.SplitHostPort(a.String()); err == nil {
+		return h
+	}
+	return a.String()
+}
+
+// admitConn applies the connection caps and registers the connection.
+func (s *Server) admitConn(c *conn) bool {
+	cl := s.rt().cl
+	preMax, preIPMax := cl.PreAuth()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case cl.MaxConns > 0 && len(s.conns) >= cl.MaxConns,
+		cl.MaxConnsPerIP > 0 && s.ipConns[c.ip] >= cl.MaxConnsPerIP,
+		preMax > 0 && s.preauth >= preMax,
+		preIPMax > 0 && s.preauthIP[c.ip] >= preIPMax:
+		return false
+	}
+	s.conns[c] = struct{}{}
+	s.ipConns[c.ip]++
+	s.preauth++
+	s.preauthIP[c.ip]++
+	c.preAuth = true
+	return true
+}
+
+// leavePreAuth is called once a connection has bound to a tenant.
+func (s *Server) leavePreAuth(c *conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c.preAuth {
+		c.preAuth = false
+		s.preauth--
+		decr(s.preauthIP, c.ip)
+	}
+}
+
+func (s *Server) dropConn(c *conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.conns, c)
+	decr(s.ipConns, c.ip)
+	if c.preAuth {
+		c.preAuth = false
+		s.preauth--
+		decr(s.preauthIP, c.ip)
+	}
+}
+
+func decr(m map[string]int, k string) {
+	if m[k]--; m[k] <= 0 {
+		delete(m, k)
+	}
+}
+
+// authLocked reports whether a client address (or user) is locked out, and
+// counts the refusal.
+func (s *Server) authLocked(ip, user string) bool {
+	if ok, _ := s.throttleIP.Allowed(ip); !ok {
+		s.M.AuthLockouts.Add(1)
+		return true
+	}
+	if user != "" {
+		if ok, _ := s.throttleUser.Allowed(user); !ok {
+			s.M.AuthLockouts.Add(1)
+			return true
+		}
+	}
+	return false
+}
+
+// authFailed feeds a failed attempt to the lockout counters.
+func (s *Server) authFailed(ip, user string) {
+	s.throttleIP.Fail(ip)
+	if user != "" {
+		s.throttleUser.Fail(user)
 	}
 }
 

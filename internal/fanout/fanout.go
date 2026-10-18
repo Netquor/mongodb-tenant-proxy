@@ -22,7 +22,10 @@ import (
 )
 
 const (
-	maxQueue      = 20000            // events buffered per subscriber before it is cut off
+	maxQueue = 20000 // events buffered per subscriber before it is cut off
+	// maxQueueBytes bounds the same by size: 20000 events of a few MiB each
+	// would otherwise let one subscriber that never reads pin gigabytes.
+	maxQueueBytes = 64 << 20
 	hubIdleGrace  = 30 * time.Second // how long an unwatched hub keeps its stream
 	upstreamBatch = 1000
 )
@@ -434,6 +437,7 @@ type Sub struct {
 
 	mu     sync.Mutex
 	queue  []bsoncore.Document
+	qbytes int               // total size of queue
 	pos    bsoncore.Document // hub position after everything queued so far
 	after  Timestamp
 	err    error
@@ -466,11 +470,12 @@ func (s *Sub) Start(after Timestamp) (bsoncore.Document, error) {
 func (s *Sub) push(ev bsoncore.Document) {
 	s.mu.Lock()
 	if s.err == nil && !s.closed {
-		if len(s.queue) >= maxQueue {
+		if len(s.queue) >= maxQueue || s.qbytes+len(ev) > maxQueueBytes {
 			s.err = ErrOverflow
-			s.queue = nil
+			s.queue, s.qbytes = nil, 0
 		} else {
 			s.queue = append(s.queue, ev)
+			s.qbytes += len(ev)
 			if op, _ := ev.Lookup("operationType").StringValueOK(); op == "invalidate" {
 				s.ended = true
 			}
@@ -505,7 +510,7 @@ func (s *Sub) fail(err error) {
 func (s *Sub) Close() {
 	s.mu.Lock()
 	s.closed = true
-	s.queue = nil
+	s.queue, s.qbytes = nil, 0
 	s.mu.Unlock()
 	s.h.remove(s)
 }
@@ -531,6 +536,7 @@ func (s *Sub) Next(max int, wait time.Duration) (events []bsoncore.Document, tok
 		for taken < len(s.queue) && len(out) < max {
 			ev := s.queue[taken]
 			taken++
+			s.qbytes -= len(ev)
 			if s.wanted(ev) {
 				out = append(out, s.shape(ev))
 			}

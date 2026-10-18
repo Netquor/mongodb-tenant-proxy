@@ -36,6 +36,11 @@ type conn struct {
 
 	reqComp wire.Compressor // compressor of the request being handled (replies mirror it)
 
+	ip         string    // client address (host part)
+	accepted   time.Time // for the handshake deadline
+	preAuth    bool      // counted against the pre-authentication caps (guarded by Server.mu)
+	closeAfter bool      // close once the reply in progress is sent
+
 	tenant     *rewrite.Tenant
 	tenantHeld bool
 	lim        *limits.Tenant // quota state of the bound tenant
@@ -76,6 +81,8 @@ func newConn(s *Server, nc net.Conn) *conn {
 		streams:  map[int64]*fanout.Sub{},
 		viewPhys: map[int64]string{},
 		log:      s.log.With("conn", id, "remote", nc.RemoteAddr().String()),
+		ip:       remoteIP(nc.RemoteAddr()),
+		accepted: time.Now(),
 	}
 	c.initOps()
 	return c
@@ -98,10 +105,7 @@ func (c *conn) serve(ctx context.Context) {
 		c.authOK()
 	}
 	for {
-		if idle := s.rt().idle; idle > 0 {
-			c.nc.SetReadDeadline(time.Now().Add(idle))
-		}
-		h, body, err := wire.ReadFrame(c.br, s.rt().maxMessage)
+		h, body, err := c.readFrame()
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && ctx.Err() == nil {
 				c.log.Debug("read failed", "err", err)
@@ -114,6 +118,12 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 		c.reqComp = wire.CompNone
+		if h.OpCode == wire.OpMsg {
+			if err = wire.VerifyChecksum(h, body); err != nil {
+				c.log.Debug("bad OP_MSG checksum", "err", err)
+				return
+			}
+		}
 		if h.OpCode == wire.OpCompressed {
 			h, body, err = c.decompress(h, body)
 			if err != nil {
@@ -135,8 +145,71 @@ func (c *conn) serve(ctx context.Context) {
 			c.log.Debug("closing connection", "err", err)
 			return
 		}
+		if c.closeAfter {
+			return
+		}
 		c.endMsg()
 	}
+}
+
+// readFrame reads the next client message under the connection's deadlines:
+// idleTimeout while waiting for it to start, handshakeTimeout (absolute, from
+// accept) until the connection has authenticated, and frameTimeout for the
+// rest of the message once its first byte is in. Before authentication the
+// message size is also capped far below maxMessageBytes.
+func (c *conn) readFrame() (wire.Header, []byte, error) {
+	rt := c.s.rt()
+	var hs time.Time
+	if c.tenant == nil {
+		if d := rt.cl.Handshake(); d > 0 {
+			hs = c.accepted.Add(d)
+		}
+	}
+	dl := hs
+	if rt.idle > 0 {
+		if t := time.Now().Add(rt.idle); dl.IsZero() || t.Before(dl) {
+			dl = t
+		}
+	}
+	c.nc.SetReadDeadline(dl)
+	if _, err := c.br.Peek(1); err != nil {
+		return wire.Header{}, nil, err
+	}
+	dl = hs
+	if d := rt.cl.Frame(); d > 0 {
+		if t := time.Now().Add(d); dl.IsZero() || t.Before(dl) {
+			dl = t
+		}
+	}
+	c.nc.SetReadDeadline(dl)
+	return wire.ReadFrame(c.br, c.msgLimit())
+}
+
+// msgLimit is the largest message (after decompression) accepted from the
+// client right now: maxMessageBytes, or far less until it has authenticated.
+func (c *conn) msgLimit() int {
+	rt := c.s.rt()
+	max := rt.maxMessage
+	if c.tenant == nil {
+		if p := rt.cl.PreAuthBytes(); p > 0 && (max <= 0 || p < max) {
+			max = p
+		}
+	}
+	return max
+}
+
+// out is the writer for everything sent to the client. Each write gets its
+// own deadline, so a client that stops reading is dropped instead of holding
+// the connection (and any upstream connection it is using) forever.
+func (c *conn) out() io.Writer { return deadlineWriter{c} }
+
+type deadlineWriter struct{ c *conn }
+
+func (w deadlineWriter) Write(p []byte) (int, error) {
+	if d := w.c.s.rt().cl.Write(); d > 0 {
+		w.c.nc.SetWriteDeadline(time.Now().Add(d))
+	}
+	return w.c.nc.Write(p)
 }
 
 // safely runs one request handler. A bug triggered by hostile input must
@@ -159,7 +232,7 @@ func (c *conn) decompress(h wire.Header, body []byte) (wire.Header, []byte, erro
 	if !ok || !c.s.clientComp[id] {
 		return h, nil, fmt.Errorf("compressor %d not enabled", id)
 	}
-	op, _, data, err := wire.Decompress(body, c.s.cfg.MaxMessageBytes)
+	op, _, data, err := wire.Decompress(body, c.msgLimit())
 	if err != nil {
 		return h, nil, err
 	}
@@ -176,9 +249,9 @@ func (c *conn) send(requestID, responseTo, opcode int32, body []byte) error {
 		if err != nil {
 			return err
 		}
-		return wire.WriteFrame(c.nc, requestID, responseTo, wire.OpCompressed, cb)
+		return wire.WriteFrame(c.out(), requestID, responseTo, wire.OpCompressed, cb)
 	}
-	return wire.WriteFrame(c.nc, requestID, responseTo, opcode, body)
+	return wire.WriteFrame(c.out(), requestID, responseTo, opcode, body)
 }
 
 func (c *conn) cleanup() {
@@ -282,6 +355,7 @@ func (c *conn) bindTenant(id string) error {
 		c.s.releaseTenant(c.tenant.ID)
 	}
 	c.tenant, c.tenantHeld = t, true
+	c.s.leavePreAuth(c)
 	c.lim = c.s.lim.For(id)
 	c.onBind(id)
 	c.log = c.log.With("tenant", id)

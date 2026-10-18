@@ -161,6 +161,13 @@ func (l *Logger) Log(e Event) {
 		e.Time = time.Now().UTC()
 	}
 	e.Reason = Scrub(e.Reason)
+	// Identifiers come from clients (user names, request paths, namespaces):
+	// one hostile value must not turn into a megabyte log line.
+	for _, f := range []*string{&e.Tenant, &e.User, &e.Remote, &e.DB, &e.Command, &e.Actor, &e.Action, &e.Target} {
+		if len(*f) > maxField {
+			*f = (*f)[:maxField] + "…"
+		}
+	}
 	b, err := json.Marshal(e)
 	if err != nil {
 		return
@@ -178,6 +185,9 @@ func (l *Logger) Close() error {
 	}
 	return l.sink.Close()
 }
+
+// maxField bounds every client-influenced identifier in an event.
+const maxField = 256
 
 var quoted = regexp.MustCompile(`"[^"]*"|'[^']*'`)
 

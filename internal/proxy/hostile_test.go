@@ -100,9 +100,11 @@ func TestHandshakeAndSASLSurviveTypeConfusion(t *testing.T) {
 		} else {
 			b = marshal(req)
 		}
+		// An unknown user gets a decoy challenge (so names cannot be
+		// enumerated); what matters is that the conversation is never done.
 		d := s.handleSASL("saslStart", b)
-		if ok, _ := d.Lookup("ok").AsInt64OK(); ok == 1 {
-			t.Errorf("saslStart with bogus credentials succeeded: %s", bson.Raw(d))
+		if done, _ := d.Lookup("done").BooleanOK(); done {
+			t.Errorf("saslStart with bogus credentials completed: %s", bson.Raw(d))
 		}
 	}
 }

@@ -135,7 +135,7 @@ func (c *conn) relayReply(h wire.Header, flags uint32, res *rewrite.Result, getM
 		if c.lim != nil {
 			c.lim.CountReply(len(rb) + 16)
 		}
-		return false, wire.WriteFrame(c.nc, rh.RequestID, h.RequestID, wire.OpCompressed, rb)
+		return false, wire.WriteFrame(c.out(), rh.RequestID, h.RequestID, wire.OpCompressed, rb)
 	}
 	if c.lim != nil && c.lim.L.MaxResultBytes > 0 && len(rb) > c.lim.L.MaxResultBytes {
 		return false, c.oversize(h, rb, res, getMoreID)
@@ -289,7 +289,7 @@ func readHeader(r io.Reader) (wire.Header, error) {
 // streamReply relays a large reply in chunks, never holding more than the
 // relay buffers.
 func (c *conn) streamReply(h wire.Header, res *rewrite.Result, getMoreID int64, rh wire.Header) error {
-	out := bufio.NewWriterSize(c.nc, relayBufSize)
+	out := bufio.NewWriterSize(c.out(), relayBufSize)
 	meta, err := relayStream(c.up.R, out, rh, h.RequestID)
 	if err != nil {
 		// Part of the reply may already be with the client: the stream is

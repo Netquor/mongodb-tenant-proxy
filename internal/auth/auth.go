@@ -43,6 +43,9 @@ type Authenticator struct {
 	sha1     *scram.Server
 	x509     []config.X509Rule
 	oidc     *oidcVerifier
+	// decoy derives credentials for names that do not exist, so that the
+	// first SCRAM round looks identical for known and unknown users.
+	decoy [32]byte
 }
 
 // UserSource supplies users that are not in the config file (the tenant
@@ -86,6 +89,9 @@ func storedCredentials(name, what, salt string, iters int, storedKey, serverKey 
 // New builds an Authenticator from configuration.
 func New(cfg config.Auth) (*Authenticator, error) {
 	a := &Authenticator{mode: string(cfg.Mode), modes: cfg.Mode, static: cfg.StaticTenant, x509: cfg.X509}
+	if _, err := rand.Read(a.decoy[:]); err != nil {
+		return nil, err
+	}
 	if cfg.AppNameSecret != "" {
 		a.secret = []byte(cfg.AppNameSecret)
 	}
@@ -252,18 +258,42 @@ func (a *Authenticator) StaticTenant() string { return a.static }
 
 func (a *Authenticator) lookup(sha1 bool) scram.CredentialLookup {
 	return func(name string) (scram.StoredCredentials, error) {
+		// Unknown users (and users without this mechanism) get a decoy
+		// credential and fail at the proof, exactly like a wrong password:
+		// failing at the first message would let anyone enumerate user names.
 		u, ok := a.find(name)
 		if !ok {
-			return scram.StoredCredentials{}, ErrAuthFailed
+			return a.decoyCredentials(name, sha1), nil
 		}
 		c := u.sha256
 		if sha1 {
 			c = u.sha1
 		}
 		if c == nil {
-			return scram.StoredCredentials{}, ErrAuthFailed
+			return a.decoyCredentials(name, sha1), nil
 		}
 		return *c, nil
+	}
+}
+
+// decoyCredentials returns stable, unguessable credentials for a user name.
+// Nobody knows a password that produces them, so no proof can verify.
+func (a *Authenticator) decoyCredentials(name string, sha1 bool) scram.StoredCredentials {
+	d := func(label string) []byte {
+		m := hmac.New(sha256.New, a.decoy[:])
+		m.Write([]byte(label))
+		m.Write([]byte{0})
+		m.Write([]byte(name))
+		return m.Sum(nil)
+	}
+	iters, salt := 15000, d("salt")
+	if sha1 {
+		iters, salt = 10000, salt[:16]
+	}
+	return scram.StoredCredentials{
+		KeyFactors: scram.KeyFactors{Salt: string(salt), Iters: iters},
+		StoredKey:  d("stored"),
+		ServerKey:  d("server"),
 	}
 }
 

@@ -29,6 +29,13 @@
   },
   "maxConnsPerTenant": 200,
   "idleTimeout": "10m",
+  "connLimits": {
+    "maxConnsPerIP": 500,
+    "maxPreAuthPerIP": 64,
+    "handshakeTimeout": "10s",
+    "frameTimeout": "2m",
+    "writeTimeout": "2m"
+  },
   "metricsAddr": "127.0.0.1:9102",
   "logLevel": "info",
   "adminAddr": "127.0.0.1:9103",
