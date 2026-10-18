@@ -18,6 +18,9 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
+	"github.com/netquor/mongodb-tenant-proxy/internal/config"
+	"github.com/netquor/mongodb-tenant-proxy/internal/proxy"
+	"github.com/netquor/mongodb-tenant-proxy/internal/stresstest"
 	"github.com/netquor/mongodb-tenant-proxy/internal/wire"
 )
 
@@ -186,4 +189,48 @@ func upstreamGauges(t testing.TB, direct *mongo.Client) (conns, cursors int64) {
 		t.Fatal(err)
 	}
 	return ss.Connections.Current, ss.Metrics.Cursor.Open.Total
+}
+
+// startProxyAt runs a proxy in front of the single mongod at up and returns
+// its address plus a stop function that shuts it down and waits for Serve to
+// return (failing the test if that takes longer than limit).
+func startProxyAt(t testing.TB, up string, mutate func(*config.Config)) (srv *proxy.Server, addr string, stop func(limit time.Duration)) {
+	t.Helper()
+	cfg := &config.Config{
+		Listen:          "127.0.0.1:0",
+		Upstream:        config.Upstream{Addr: up},
+		Auth:            config.Auth{Mode: "appname"},
+		Tenant:          config.Tenant{Field: "tenantId"},
+		MaxMessageBytes: 48 << 20,
+	}
+	if mutate != nil {
+		mutate(cfg)
+	}
+	cfg.Upstream.Addr = up
+	srv, err := proxy.New(cfg, testLogger(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { srv.Serve(ctx, ln); close(done) }()
+	var once sync.Once
+	stop = func(limit time.Duration) {
+		once.Do(func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(limit):
+				t.Logf("upstream state: %+v", srv.UpstreamStats())
+				stresstest.DumpOnce("graceful shutdown did not finish")
+				t.Errorf("proxy did not shut down within %s", limit)
+			}
+		})
+	}
+	t.Cleanup(func() { stop(60 * time.Second) })
+	return srv, ln.Addr().String(), stop
 }

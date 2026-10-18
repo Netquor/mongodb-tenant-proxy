@@ -65,6 +65,7 @@ type Manager struct {
 	mu     sync.Mutex
 	hubs   map[string]*hub
 	closed bool
+	wg     sync.WaitGroup // hub.run goroutines
 }
 
 // NewManager creates a Manager.
@@ -100,6 +101,7 @@ func (m *Manager) Close() {
 		h.cancel()
 		h.failAll(errClosed)
 	}
+	m.wg.Wait() // hubs kill their upstream cursors before returning
 }
 
 // TenantKey is the routing key for a tenant value.
@@ -233,7 +235,8 @@ func (h *hub) start(at Timestamp) error {
 	h.mu.Lock()
 	if !h.started {
 		h.started = true
-		go h.run(at)
+		h.m.wg.Add(1)
+		go func() { defer h.m.wg.Done(); h.run(at) }()
 	}
 	h.mu.Unlock()
 	timeout := time.NewTimer(20 * time.Second)
@@ -331,6 +334,16 @@ func (h *hub) stream(first Timestamp, token *bsoncore.Document, ready func(error
 	defer scancel()
 	defer c.Close()
 	go func() { <-sctx.Done(); c.Close() }()
+	// A server-side change stream cursor outlives its connection (mongod only
+	// reaps it after the 10 minute cursor timeout), so every hub that ends -
+	// idle shutdown, server shutdown, a stream broken mid-way - would leave
+	// one behind. Kill it from a fresh connection on the way out.
+	var cursor int64
+	defer func() {
+		if cursor != 0 {
+			h.killCursor(cursor)
+		}
+	}()
 
 	mode := "required"
 	if h.coll == "" {
@@ -386,6 +399,7 @@ func (h *hub) stream(first Timestamp, token *bsoncore.Document, ready func(error
 		}
 		cur, _ := resp.Lookup("cursor").DocumentOK()
 		id, _ := cur.Lookup("id").AsInt64OK()
+		cursor = id
 		batch, _ := cur.Lookup("firstBatch").ArrayOK()
 		if batch == nil {
 			batch, _ = cur.Lookup("nextBatch").ArrayOK()
@@ -404,6 +418,23 @@ func (h *hub) stream(first Timestamp, token *bsoncore.Document, ready func(error
 		)
 		resp, err = m.Dial.RunCommand(c, h.db, next)
 	}
+}
+
+// killCursor best-effort kills the hub's upstream cursor on a fresh
+// connection (the stream's own may be closed or mid-getMore).
+func (h *hub) killCursor(id int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	c, err := h.m.Dial.Dial(ctx)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(3 * time.Second))
+	h.m.Dial.RunCommand(c, h.db, bsoncore.BuildDocument(nil,
+		bsoncore.AppendStringElement(nil, "killCursors", h.collName()),
+		bsoncore.AppendArrayElement(nil, "cursors", bsoncore.BuildArray(nil,
+			bsoncore.Value{Type: bsoncore.TypeInt64, Data: bsoncore.AppendInt64(nil, id)}))))
 }
 
 func appendElem(d bsoncore.Document, elem []byte) bsoncore.Document {
