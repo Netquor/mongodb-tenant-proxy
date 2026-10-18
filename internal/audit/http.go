@@ -20,6 +20,8 @@ type HTTPSink struct {
 
 	mu      sync.Mutex
 	dropped int64
+
+	closeOnce sync.Once
 }
 
 // NewHTTPSink starts the background shipper.
@@ -109,7 +111,7 @@ func (h *HTTPSink) post(body []byte) {
 
 // Close flushes queued events and stops the shipper.
 func (h *HTTPSink) Close() error {
-	close(h.done)
+	h.closeOnce.Do(func() { close(h.done) }) // a second Close must not panic
 	h.wg.Wait()
 	return nil
 }
