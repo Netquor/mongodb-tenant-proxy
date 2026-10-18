@@ -51,6 +51,7 @@ func (c *conn) exchange(h wire.Header, flags uint32, res *rewrite.Result, getMor
 		if err := wire.WriteFrame(c.up, h.RequestID, 0, wire.OpMsg, frame); err != nil {
 			c.upFailed(err)
 			if retry && c.useUp(rt) == nil {
+				c.s.M.UpstreamRetries.Add(1)
 				continue
 			}
 			c.s.M.Command(res.Command, "error")
@@ -62,6 +63,7 @@ func (c *conn) exchange(h wire.Header, flags uint32, res *rewrite.Result, getMor
 		}
 		again, err := c.relayReply(h, flags, res, getMoreID, rt, retry)
 		if again {
+			c.s.M.UpstreamRetries.Add(1)
 			if c.useUp(rt) == nil {
 				continue
 			}
@@ -248,6 +250,7 @@ func (c *conn) streamReply(h wire.Header, res *rewrite.Result, getMoreID int64, 
 		c.noteCursor(res.Command, getMoreID, meta.ok, meta.cursorID, meta.ns)
 	}
 	c.afterReply(res.Command, c.rt)
+	c.s.M.StreamedReplies.Add(1)
 	c.s.M.Command(res.Command, "ok")
 	c.s.M.BytesOut.Add(int64(rh.Length))
 	return nil

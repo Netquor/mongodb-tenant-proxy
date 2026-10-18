@@ -146,9 +146,10 @@ func (w *walker) document(on func(key string, t byte) (bool, error)) error {
 	if err != nil {
 		return err
 	}
-	if size < 5 {
+	if size < 5 || size-4 > w.left {
 		return errMalformedReply
 	}
+	end := w.left - (size - 4) // frame bytes remaining once this document is done
 	for {
 		tb, err := w.read(1)
 		if err != nil {
@@ -156,7 +157,13 @@ func (w *walker) document(on func(key string, t byte) (bool, error)) error {
 		}
 		t := tb[0]
 		if t == 0 {
+			if w.left != end {
+				return fmt.Errorf("%w: document length mismatch", errMalformedReply)
+			}
 			return nil
+		}
+		if w.left < end {
+			return errMalformedReply
 		}
 		key, err := w.cstring()
 		if err != nil {
@@ -175,18 +182,26 @@ func (w *walker) document(on func(key string, t byte) (bool, error)) error {
 }
 
 func (w *walker) number(t byte) (float64, bool, error) {
+	var n int
+	switch t {
+	case 0x01, 0x12:
+		n = 8
+	case 0x10:
+		n = 4
+	default:
+		return 0, false, nil
+	}
+	b, err := w.read(n)
+	if err != nil {
+		return 0, true, err
+	}
 	switch t {
 	case 0x01:
-		b, err := w.read(8)
-		return math.Float64frombits(binary.LittleEndian.Uint64(b)), true, err
+		return math.Float64frombits(binary.LittleEndian.Uint64(b)), true, nil
 	case 0x10:
-		b, err := w.read(4)
-		return float64(int32(binary.LittleEndian.Uint32(b))), true, err
-	case 0x12:
-		b, err := w.read(8)
-		return float64(int64(binary.LittleEndian.Uint64(b))), true, err
+		return float64(int32(binary.LittleEndian.Uint32(b))), true, nil
 	}
-	return 0, false, nil
+	return float64(int64(binary.LittleEndian.Uint64(b))), true, nil
 }
 
 // relayStream forwards the rest of a reply whose 16-byte header has been read

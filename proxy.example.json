@@ -1,8 +1,9 @@
 {
   "listen": ":27018",
   "upstream": {
-    "uri": "mongodb://proxy-user:CHANGE_ME@mongo.internal:27017/?authSource=admin&tls=true",
-    "caFile": "/etc/ssl/mongo-ca.pem"
+    "uri": "mongodb://proxy-user:CHANGE_ME@mongo-1.internal:27017,mongo-2.internal:27017,mongo-3.internal:27017/?replicaSet=rs0&authSource=admin&tls=true",
+    "caFile": "/etc/ssl/mongo-ca.pem",
+    "pool": { "mode": "pooled", "maxSize": 100, "idleTimeout": "5m" }
   },
   "tenant": { "field": "tenantId", "idType": "string" },
   "databases": ["app"],
