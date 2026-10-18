@@ -26,12 +26,24 @@ type Config struct {
 	DenyCommands []string `json:"denyCommands,omitempty"`
 	// AllowJS permits $where/$function/$accumulator.
 	AllowJS bool `json:"allowJS,omitempty"`
+	// ChangeStreams controls collection-level change streams.
+	ChangeStreams ChangeStreams `json:"changeStreams,omitempty"`
 
 	MaxMessageBytes   int    `json:"maxMessageBytes,omitempty"`
 	MaxConnsPerTenant int    `json:"maxConnsPerTenant,omitempty"`
 	IdleTimeout       string `json:"idleTimeout,omitempty"`
 	MetricsAddr       string `json:"metricsAddr,omitempty"`
 	LogLevel          string `json:"logLevel,omitempty"`
+}
+
+// ChangeStreams configures change stream support. Streams are filtered using
+// collection pre/post images (MongoDB 6.0+), which cost oplog/storage on
+// the collections concerned.
+type ChangeStreams struct {
+	Enabled bool `json:"enabled,omitempty"`
+	// AutoEnableImages lets the proxy turn on changeStreamPreAndPostImages
+	// (using its upstream credentials) the first time a collection is watched.
+	AutoEnableImages bool `json:"autoEnableImages,omitempty"`
 }
 
 // ClientTLS configures the listener's TLS.

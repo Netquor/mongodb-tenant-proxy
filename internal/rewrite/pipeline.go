@@ -66,6 +66,20 @@ func (r *Rewriter) scopePipeline(t *Tenant, p arr, inject bool) (arr, error) {
 			if i == 0 {
 				scopedFirst = true
 			}
+		case "$changeStream":
+			if !r.cs {
+				return nil, deny("change streams are not enabled")
+			}
+			if !inject || i != 0 {
+				return nil, deny("$changeStream must be the first stage of a collection aggregate")
+			}
+			cs, err := r.rewriteChangeStream(t, spec)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, cs...)
+			scopedFirst = true
+			continue
 		case "$lookup":
 			ns, err = r.rewriteLookup(t, spec)
 		case "$graphLookup":
@@ -288,4 +302,68 @@ func (r *Rewriter) rewriteFacet(t *Tenant, spec value) (value, error) {
 		out = bsoncore.AppendArrayElement(out, e.Key(), np)
 	}
 	return docValue(finishDoc(out)), nil
+}
+
+// rewriteChangeStream expands $changeStream into a tenant-safe sequence:
+//
+//  1. $changeStream with pre/post images forced on, so every insert, update,
+//     replace and delete event carries the tenant field;
+//  2. a $match on those images, placed before any client stage;
+//  3. stages that reshape events back to what the client asked for.
+//
+// Events without a tenant image (drop, rename, invalidate, ...) are dropped.
+func (r *Rewriter) rewriteChangeStream(t *Tenant, spec value) ([]value, error) {
+	d, ok := spec.DocumentOK()
+	if !ok {
+		return nil, badValue("$changeStream requires a document")
+	}
+	elems, err := d.Elements()
+	if err != nil {
+		return nil, badValue("malformed $changeStream")
+	}
+	if err := checkNoDuplicateKeys(elems); err != nil {
+		return nil, err
+	}
+	clientFull, clientBefore := "default", "off"
+	out := make([]byte, 4, len(d)+64)
+	for _, e := range elems {
+		switch e.Key() {
+		case "allChangesForCluster":
+			return nil, deny("cluster-wide change streams are not permitted")
+		case "fullDocument":
+			clientFull, _ = e.Value().StringValueOK()
+		case "fullDocumentBeforeChange":
+			clientBefore, _ = e.Value().StringValueOK()
+		default:
+			out = append(out, e...)
+		}
+	}
+	out = bsoncore.AppendStringElement(out, "fullDocument", "required")
+	out = bsoncore.AppendStringElement(out, "fullDocumentBeforeChange", "required")
+	stages := []value{docValue(buildDoc(bsoncore.AppendDocumentElement(nil, "$changeStream", finishDoc(out))))}
+
+	match := arrayOf(
+		docValue(buildDoc(valElem("fullDocument."+r.field, t.Value))),
+		docValue(buildDoc(valElem("fullDocumentBeforeChange."+r.field, t.Value))),
+	)
+	stages = append(stages, docValue(buildDoc(bsoncore.AppendDocumentElement(nil, "$match",
+		buildDoc(bsoncore.AppendArrayElement(nil, "$or", match))))))
+
+	if clientBefore == "off" {
+		stages = append(stages, docValue(buildDoc(bsoncore.AppendStringElement(nil, "$unset", "fullDocumentBeforeChange"))))
+	}
+	if clientFull == "default" {
+		// Plain streams only expose fullDocument for inserts and replaces.
+		cond := buildDoc(bsoncore.AppendArrayElement(nil, "$cond", arrayOf(
+			docValue(buildDoc(bsoncore.AppendArrayElement(nil, "$eq", arrayOf(
+				value{Type: bsoncore.TypeString, Data: bsoncore.AppendString(nil, "$operationType")},
+				value{Type: bsoncore.TypeString, Data: bsoncore.AppendString(nil, "update")},
+			)))),
+			value{Type: bsoncore.TypeString, Data: bsoncore.AppendString(nil, "$$REMOVE")},
+			value{Type: bsoncore.TypeString, Data: bsoncore.AppendString(nil, "$fullDocument")},
+		)))
+		stages = append(stages, docValue(buildDoc(bsoncore.AppendDocumentElement(nil, "$set",
+			buildDoc(bsoncore.AppendDocumentElement(nil, "fullDocument", cond))))))
+	}
+	return stages, nil
 }

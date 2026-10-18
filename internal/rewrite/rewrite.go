@@ -60,6 +60,9 @@ type Config struct {
 	DenyCommands []string
 	// AllowJS permits $where/$function/$accumulator.
 	AllowJS bool
+	// ChangeStreams permits collection-level change streams. They rely on
+	// collection pre/post images so events can be filtered by tenant.
+	ChangeStreams bool
 }
 
 // Rewriter rewrites commands for a tenant. It is safe for concurrent use.
@@ -68,6 +71,7 @@ type Rewriter struct {
 	dbs   map[string]struct{}
 	deny  map[string]struct{}
 	js    bool
+	cs    bool
 	cmds  map[string]cmdFn
 }
 
@@ -76,7 +80,7 @@ func New(cfg Config) *Rewriter {
 	if cfg.Field == "" {
 		cfg.Field = "tenantId"
 	}
-	r := &Rewriter{field: cfg.Field, js: cfg.AllowJS, dbs: map[string]struct{}{}, deny: map[string]struct{}{}}
+	r := &Rewriter{field: cfg.Field, js: cfg.AllowJS, cs: cfg.ChangeStreams, dbs: map[string]struct{}{}, deny: map[string]struct{}{}}
 	for _, d := range cfg.Databases {
 		r.dbs[d] = struct{}{}
 	}
@@ -126,8 +130,12 @@ var aliases = map[string]string{
 type Result struct {
 	Command string
 	DB      string
-	Body    bsoncore.Document
-	Seqs    []wire.Seq
+	// ChangeStream marks an aggregate that opens a change stream; the proxy
+	// makes sure pre/post images are enabled on the collection first.
+	ChangeStream bool
+	Collection   string
+	Body         bsoncore.Document
+	Seqs         []wire.Seq
 	// Reply, when non-nil, is sent to the client without contacting the
 	// upstream server.
 	Reply bsoncore.Document
@@ -355,7 +363,16 @@ func (r *Rewriter) cmdAggregate(q *request) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Result{Body: b}, nil
+	res := &Result{Body: b}
+	if st, err := q.body.Lookup("pipeline").Array().Values(); err == nil && len(st) > 0 {
+		if d, ok := st[0].DocumentOK(); ok {
+			if e, err := d.IndexErr(0); err == nil && e.Key() == "$changeStream" {
+				res.ChangeStream = true
+				res.Collection, _ = r.collection(q)
+			}
+		}
+	}
+	return res, nil
 }
 
 // ---- writes --------------------------------------------------------------

@@ -35,6 +35,7 @@ type Server struct {
 	conns  map[*conn]struct{}
 	tenant map[string]int
 	wg     sync.WaitGroup
+	images sync.Map // "db.coll" -> struct{}: pre/post images known to be on
 }
 
 type helloLimits struct {
@@ -60,10 +61,11 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		conns:  map[*conn]struct{}{},
 		tenant: map[string]int{},
 		rw: rewrite.New(rewrite.Config{
-			Field:        cfg.Tenant.Field,
-			Databases:    cfg.Databases,
-			DenyCommands: cfg.DenyCommands,
-			AllowJS:      cfg.AllowJS,
+			Field:         cfg.Tenant.Field,
+			Databases:     cfg.Databases,
+			DenyCommands:  cfg.DenyCommands,
+			AllowJS:       cfg.AllowJS,
+			ChangeStreams: cfg.ChangeStreams.Enabled,
 		}),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

@@ -22,8 +22,9 @@ app (driver) ──► mongodb-tenant-proxy ──► MongoDB (replica set / sta
 | `getMore` / `killCursors` | only cursors opened on the same connection are usable |
 | `listDatabases` | filtered to accessible databases |
 | `explain` | inner command is rewritten |
+| `$changeStream` | opt-in, collection-level only – see below |
 
-Everything else is **denied** by default: `$out`, `$merge`, `$currentOp`, `$collStats`, `$indexStats`, `$changeStream`, `$search`, `$documents`, `dropDatabase`, `renameCollection`, `collMod`, `mapReduce`, views, `system.*` collections, `admin`/`local`/`config`, server-side JavaScript (`$where`, `$function`, `$accumulator` unless `allowJS`), duplicate command keys, and unknown commands. Denials are returned as `Unauthorized (13)` and logged.
+Everything else is **denied** by default: `$out`, `$merge`, `$currentOp`, `$collStats`, `$indexStats`, `$search`, `$documents`, `dropDatabase`, `renameCollection`, `collMod`, `mapReduce`, views, `system.*` collections, `admin`/`local`/`config`, server-side JavaScript (`$where`, `$function`, `$accumulator` unless `allowJS`), duplicate command keys, and unknown commands. Denials are returned as `Unauthorized (13)` and logged.
 
 ## Identifying the tenant (`auth.mode`)
 
@@ -32,6 +33,12 @@ Everything else is **denied** by default: `$out`, `$merge`, `$currentOp`, `$coll
 * **`static`** – every connection belongs to `staticTenant` (one proxy/port per tenant, e.g. behind per-tenant network policy).
 
 The proxy authenticates to MongoDB itself (SCRAM-SHA-256, optional TLS) and presents itself to drivers as a `mongos`, so drivers never discover and bypass it via replica-set member addresses.
+
+## Change streams
+
+Enable with `"changeStreams": {"enabled": true, "autoEnableImages": true}` (MongoDB 6.0+). Delete and update events don't contain the tenant field, so the proxy forces `fullDocument`/`fullDocumentBeforeChange: "required"` (collection pre/post images), puts a `$match` on those images directly after `$changeStream` (before any client stage), and strips the images again unless the client asked for them. A tenant therefore only ever receives its own events, with no per-event lookups and no proxy-side state. `autoEnableImages` lets the proxy run `collMod` with its own credentials the first time a collection is watched; otherwise enable `changeStreamPreAndPostImages` yourself.
+
+Trade-offs: pre/post images add oplog/storage cost on watched collections; filtering is server-side, so each open stream still scans the shared oplog (cost grows with watchers). Database- and cluster-level streams are refused, and drop/rename/invalidate events are not delivered to tenants.
 
 ## Run
 
@@ -54,7 +61,7 @@ See [`proxy.example.json`](proxy.example.json). Metrics (`/metrics`, Prometheus 
 * `_id` is unique per *collection*, not per tenant. Use generated ObjectIds/UUIDs; a natural `_id` reused by two tenants will collide (and reveals existence).
 * Indexes are shared physical objects: one tenant creating an index affects all; `dropIndexes: "*"` is refused. Deny `createIndexes`/`dropIndexes` via `denyCommands` if tenants must not manage indexes. TTL indexes cannot carry the tenant prefix (unique TTL indexes are refused).
 * The `tenantId` field is visible in returned documents.
-* No wire compression (not advertised), no `SCRAM-SHA-1`/x.509 on the client side, no change streams.
+* No wire compression (not advertised), no `SCRAM-SHA-1`/x.509 on the client side.
 * Session ids (`lsid`) are unguessable UUIDs but are not bound to a tenant.
 
 ## Tests
