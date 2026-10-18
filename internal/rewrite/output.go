@@ -37,6 +37,16 @@ const outMarker = "__mtp_out"
 // means a tenant can never overwrite another tenant's document. Documents are
 // stamped with the tenant immediately before the write.
 func (r *Rewriter) rewriteWrite(t *Tenant, stage string, spec value, ex *extras) ([]value, error) {
+	w, err := r.rewriteWriteStages(t, stage, spec, ex)
+	if err == nil && r.genOn() {
+		// Documents produced by a pipeline have computed _ids; make sure they
+		// are ObjectIds before they reach the shared collection.
+		w = append([]value{idCheckStage()}, w...)
+	}
+	return w, err
+}
+
+func (r *Rewriter) rewriteWriteStages(t *Tenant, stage string, spec value, ex *extras) ([]value, error) {
 	stamp := docValue(buildDoc(bsoncore.AppendDocumentElement(nil, "$set", r.tenantDoc(t))))
 	if stage == "$out" {
 		return r.rewriteOut(t, spec, ex, stamp)
@@ -289,6 +299,9 @@ func (r *Rewriter) cmdMapReduce(q *request) (*Result, error) {
 	}
 	if !r.js {
 		return nil, deny("mapReduce runs server-side JavaScript, which is disabled")
+	}
+	if r.nsOn() {
+		return nil, nsUnsupported("mapReduce")
 	}
 	b, err := r.scopeField(q, q.body, "query")
 	if err != nil {

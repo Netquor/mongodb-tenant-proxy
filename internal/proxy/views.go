@@ -469,6 +469,9 @@ func patchTop(d bsoncore.Document, key string, v bsoncore.Value) bsoncore.Docume
 // validatorsIn returns the tenant's own collMod validators in db by collection.
 func (c *conn) validatorsIn(db string) map[string]bsoncore.Document {
 	out := map[string]bsoncore.Document{}
+	if c.tenant == nil {
+		return out
+	}
 	resp, err := c.run(db, bsoncore.BuildDocument(nil,
 		bsoncore.AppendStringElement(nil, "find", rewrite.ValidatorsColl),
 		bsoncore.AppendDocumentElement(nil, "filter", bsoncore.BuildDocument(nil, valueElem(c.s.cfg.Tenant.Field, c.tenant.Value))),

@@ -11,7 +11,7 @@ import (
 	"github.com/netquor/mongodb-tenant-proxy/internal/wire"
 )
 
-func seqOf(t testing.TB, id string, docs ...any) wire.Seq {
+func seqOfT(t testing.TB, id string, docs ...any) wire.Seq {
 	s := wire.Seq{ID: id}
 	for _, d := range docs {
 		s.Docs = append(s.Docs, mk(t, d))
@@ -46,13 +46,13 @@ func bulkCmd(extra ...bson.E) bson.D {
 func TestBulkWriteSequences(t *testing.T) {
 	r := New(Config{})
 	res := mustRewrite(t, r, bulkCmd(),
-		seqOf(t, "ops",
+		seqOfT(t, "ops",
 			bson.D{{Key: "insert", Value: 0}, {Key: "document", Value: bson.M{"a": 1}}},
 			bson.D{{Key: "update", Value: 1}, {Key: "filter", Value: bson.M{"a": 1}}, {Key: "updateMods", Value: bson.M{"$set": bson.M{"b": 2}}}, {Key: "multi", Value: true}},
 			bson.D{{Key: "update", Value: 0}, {Key: "filter", Value: bson.M{}}, {Key: "updateMods", Value: bson.A{bson.M{"$set": bson.M{"c": 1}}}}},
 			bson.D{{Key: "update", Value: 0}, {Key: "filter", Value: bson.M{"z": 1}}, {Key: "updateMods", Value: bson.M{"replaced": true}}, {Key: "upsert", Value: true}},
 			bson.D{{Key: "delete", Value: 1}, {Key: "filter", Value: bson.M{"a": bson.M{"$gt": 1}}}, {Key: "multi", Value: true}}),
-		seqOf(t, "nsInfo", bson.M{"ns": "app.c1"}, bson.M{"ns": "other.c2"}))
+		seqOfT(t, "nsInfo", bson.M{"ns": "app.c1"}, bson.M{"ns": "other.c2"}))
 	if CommandName(res.Body) != "bulkWrite" {
 		t.Fatal("command name moved")
 	}
@@ -104,8 +104,8 @@ func TestBulkWriteArrays(t *testing.T) {
 
 func TestBulkWriteRejections(t *testing.T) {
 	r := New(Config{})
-	ns := func(n string) wire.Seq { return seqOf(t, "nsInfo", bson.M{"ns": n}) }
-	ins := seqOf(t, "ops", bson.D{{Key: "insert", Value: 0}, {Key: "document", Value: bson.M{"a": 1}}})
+	ns := func(n string) wire.Seq { return seqOfT(t, "nsInfo", bson.M{"ns": n}) }
+	ins := seqOfT(t, "ops", bson.D{{Key: "insert", Value: 0}, {Key: "document", Value: bson.M{"a": 1}}})
 	for name, n := range map[string]string{
 		"admin": "admin.x", "local": "local.x", "config": "config.x", "system": "app.system.users",
 		"reserved": "app.__mtp_views", "no dot": "app", "dollar": "app.a$b", "empty coll": "app.",
@@ -128,9 +128,9 @@ func TestBulkWriteRejections(t *testing.T) {
 		"bad stage":        {{Key: "update", Value: 0}, {Key: "filter", Value: bson.M{}}, {Key: "updateMods", Value: bson.A{bson.M{"$lookup": bson.M{"from": "x"}}}}},
 		"js filter":        {{Key: "delete", Value: 0}, {Key: "filter", Value: bson.M{"$where": "1"}}},
 	} {
-		mustDeny(t, r, name, bulkCmd(), seqOf(t, "ops", op), good)
+		mustDeny(t, r, name, bulkCmd(), seqOfT(t, "ops", op), good)
 	}
-	mustDeny(t, r, "tenant in nsInfo extra", bulkCmd(), ins, seqOf(t, "nsInfo", bson.M{"ns": "app.c", "x": 1}))
+	mustDeny(t, r, "tenant in nsInfo extra", bulkCmd(), ins, seqOfT(t, "nsInfo", bson.M{"ns": "app.c", "x": 1}))
 	mustDeny(t, r, "missing nsInfo", bulkCmd(), ins)
 	mustDeny(t, r, "missing ops", bulkCmd(), good)
 	mustDeny(t, r, "both forms", bulkCmd(bson.E{Key: "ops", Value: bson.A{}}), ins, good)

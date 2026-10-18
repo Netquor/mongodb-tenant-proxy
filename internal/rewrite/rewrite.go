@@ -68,6 +68,8 @@ type Config struct {
 	// AtomicOut, when it returns true, makes $out swap the tenant's documents
 	// in a single transaction (needs a replica-set or sharded upstream).
 	AtomicOut func() bool
+	// IDPolicy is "native" (default), "require-generated" or "namespace".
+	IDPolicy string
 }
 
 // Rewriter rewrites commands for a tenant. It is safe for concurrent use.
@@ -81,6 +83,7 @@ type Rewriter struct {
 
 	started   time.Time
 	atomicOut func() bool
+	idPolicy  string
 }
 
 // New creates a Rewriter.
@@ -88,7 +91,7 @@ func New(cfg Config) *Rewriter {
 	if cfg.Field == "" {
 		cfg.Field = "tenantId"
 	}
-	r := &Rewriter{field: cfg.Field, js: cfg.AllowJS, cs: cfg.ChangeStreams, started: time.Now(), atomicOut: cfg.AtomicOut, dbs: map[string]struct{}{}, deny: map[string]struct{}{}}
+	r := &Rewriter{field: cfg.Field, js: cfg.AllowJS, cs: cfg.ChangeStreams, started: time.Now(), atomicOut: cfg.AtomicOut, idPolicy: cfg.IDPolicy, dbs: map[string]struct{}{}, deny: map[string]struct{}{}}
 	for _, d := range cfg.Databases {
 		r.dbs[d] = struct{}{}
 	}
@@ -178,6 +181,11 @@ type Result struct {
 	Namespaces []string
 	// Post, when non-nil, transforms the upstream reply before it is sent.
 	Post func(bsoncore.Document) bsoncore.Document
+	// IDCursor marks a cursor whose documents carry wrapped _id values
+	// (idPolicy namespace); the proxy re-applies the unwrapping to getMore.
+	IDCursor bool
+
+	idDistinct bool
 }
 
 type request struct {
@@ -241,6 +249,7 @@ func (r *Rewriter) Rewrite(t *Tenant, db string, body bsoncore.Document, seqs []
 	}
 	res.Command = name
 	res.DB = db
+	r.attachIDPost(q, res)
 	return res, nil
 }
 
@@ -385,6 +394,13 @@ func (r *Rewriter) scopeField(q *request, body doc, key string) (doc, error) {
 			}
 			return *old, true, r.scan(*old)
 		}
+		if r.nsOn() && old != nil {
+			nv, err := r.nsFilterVal(q.t, *old)
+			if err != nil {
+				return value{}, false, err
+			}
+			old = &nv
+		}
 		v, err := r.scopeFilter(q.t, old)
 		return v, true, err
 	})
@@ -483,11 +499,19 @@ func (r *Rewriter) cmdFind(q *request) (*Result, error) {
 	if _, err := r.collection(q); err != nil {
 		return nil, err
 	}
+	if r.nsOn() {
+		if q.body.Lookup("min").Type != 0 || q.body.Lookup("max").Type != 0 {
+			return nil, nsUnsupported("min/max")
+		}
+		if refsID(q.body.Lookup("projection")) {
+			return nil, nsUnsupported("projections that reference _id or $$ROOT")
+		}
+	}
 	b, err := r.scopeField(q, q.body, "filter")
 	if err != nil {
 		return nil, err
 	}
-	return &Result{Body: b}, nil
+	return &Result{Body: b, IDCursor: r.nsOn()}, nil
 }
 
 func (r *Rewriter) cmdCount(q *request) (*Result, error) {
@@ -501,7 +525,23 @@ func (r *Rewriter) cmdCount(q *request) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Result{Body: b}, nil
+	res := &Result{Body: b}
+	if r.nsOn() && q.cmd == "distinct" {
+		key, _ := q.body.Lookup("key").StringValueOK()
+		switch {
+		case key == "_id":
+			res.idDistinct = true
+		case strings.HasPrefix(key, "_id."):
+			b, err = setField(b, "key", func(*value) (value, bool, error) {
+				return value{Type: bsoncore.TypeString, Data: bsoncore.AppendString(nil, "_id.id."+key[len("_id."):])}, true, nil
+			})
+			if err != nil {
+				return nil, err
+			}
+			res.Body = b
+		}
+	}
+	return res, nil
 }
 
 func (r *Rewriter) cmdAggregate(q *request) (*Result, error) {
@@ -537,6 +577,7 @@ func (r *Rewriter) cmdAggregate(q *request) (*Result, error) {
 	} else if _, err := r.collection(q); err != nil {
 		return nil, err
 	}
+	nsWrapped := false
 	b, err := setField(q.body, "pipeline", func(old *value) (value, bool, error) {
 		if old == nil {
 			return value{}, false, badValue("aggregate requires a pipeline")
@@ -545,13 +586,19 @@ func (r *Rewriter) cmdAggregate(q *request) (*Result, error) {
 		if !ok {
 			return value{}, false, badValue("pipeline must be an array")
 		}
+		if r.nsOn() {
+			var err error
+			if p, nsWrapped, err = r.nsPipeline(q.t, p); err != nil {
+				return value{}, false, err
+			}
+		}
 		np, err := r.scopePipeline(q.t, p, !q.noScope, ex)
 		return arrValue(np), true, err
 	})
 	if err != nil {
 		return nil, err
 	}
-	res := &Result{Body: b, Before: ex.before, After: ex.after}
+	res := &Result{Body: b, Before: ex.before, After: ex.after, IDCursor: nsWrapped}
 	if pa, ok := q.body.Lookup("pipeline").ArrayOK(); !ok {
 	} else if st, err := pa.Values(); err == nil && len(st) > 0 {
 		if d, ok := st[0].DocumentOK(); ok {
@@ -598,6 +645,14 @@ func (r *Rewriter) ensureTenant(t *Tenant, d doc) (doc, error) {
 	return out, nil
 }
 
+func (r *Rewriter) insertDoc(t *Tenant, d doc) (doc, error) {
+	d, err := r.ensureTenant(t, d)
+	if err != nil {
+		return nil, err
+	}
+	return r.policyInsertDoc(t, d)
+}
+
 func (r *Rewriter) cmdInsert(q *request) (*Result, error) {
 	if err := noSeqs(q, "documents"); err != nil {
 		return nil, err
@@ -613,7 +668,7 @@ func (r *Rewriter) cmdInsert(q *request) (*Result, error) {
 	if _, ok := q.body.Lookup("documents").ArrayOK(); ok {
 		res.Body, err = setField(q.body, "documents", func(old *value) (value, bool, error) {
 			a, _ := old.ArrayOK()
-			na, err := mapDocs(a, func(d doc) (doc, error) { return r.ensureTenant(q.t, d) })
+			na, err := mapDocs(a, func(d doc) (doc, error) { return r.insertDoc(q.t, d) })
 			return arrValue(na), true, err
 		})
 		if err != nil {
@@ -623,7 +678,7 @@ func (r *Rewriter) cmdInsert(q *request) (*Result, error) {
 	for _, s := range q.seqs {
 		ns := wire.Seq{ID: s.ID, Docs: make([]bsoncore.Document, len(s.Docs))}
 		for i, d := range s.Docs {
-			if ns.Docs[i], err = r.ensureTenant(q.t, d); err != nil {
+			if ns.Docs[i], err = r.insertDoc(q.t, d); err != nil {
 				return nil, err
 			}
 		}
@@ -685,7 +740,19 @@ func (r *Rewriter) cmdUpdate(q *request) (*Result, error) {
 }
 
 func (r *Rewriter) rewriteUpdateStmt(t *Tenant, d doc) (doc, error) {
+	var origQ *value
+	if v := d.Lookup("q"); v.Type != 0 {
+		origQ = &v
+	}
+	upsert, _ := d.Lookup("upsert").BooleanOK()
 	d, err := setField(d, "q", func(old *value) (value, bool, error) {
+		if r.nsOn() && old != nil {
+			nv, err := r.nsFilterVal(t, *old)
+			if err != nil {
+				return value{}, false, err
+			}
+			old = &nv
+		}
 		v, err := r.scopeFilter(t, old)
 		return v, true, err
 	})
@@ -697,6 +764,10 @@ func (r *Rewriter) rewriteUpdateStmt(t *Tenant, d doc) (doc, error) {
 			return value{}, false, badValue("update statement requires u")
 		}
 		v, err := r.rewriteUpdateSpec(t, *old)
+		if err != nil {
+			return value{}, false, err
+		}
+		v, err = r.policyUpdate(t, origQ, v, upsert)
 		return v, true, err
 	})
 }
@@ -810,6 +881,14 @@ func (r *Rewriter) cmdFindAndModify(q *request) (*Result, error) {
 	if _, err := r.collection(q); err != nil {
 		return nil, err
 	}
+	if r.nsOn() && refsID(q.body.Lookup("fields")) {
+		return nil, nsUnsupported("projections that reference _id or $$ROOT")
+	}
+	var origQ *value
+	if v := q.body.Lookup("query"); v.Type != 0 {
+		origQ = &v
+	}
+	upsert, _ := q.body.Lookup("upsert").BooleanOK()
 	b, err := r.scopeField(q, q.body, "query")
 	if err != nil {
 		return nil, err
@@ -817,6 +896,10 @@ func (r *Rewriter) cmdFindAndModify(q *request) (*Result, error) {
 	if q.body.Lookup("update").Type != 0 {
 		b, err = setField(b, "update", func(old *value) (value, bool, error) {
 			v, err := r.rewriteUpdateSpec(q.t, *old)
+			if err != nil {
+				return value{}, false, err
+			}
+			v, err = r.policyUpdate(q.t, origQ, v, upsert)
 			return v, true, err
 		})
 		if err != nil {

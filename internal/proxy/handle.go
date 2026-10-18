@@ -23,6 +23,16 @@ func (c *conn) handleMsg(h wire.Header, body []byte) error {
 		return c.reply(h, toErrorDoc(err))
 	}
 
+	if rel, bad := c.admit(name, m, len(body)); bad != nil {
+		if m.Flags&wire.FlagMoreToCome != 0 {
+			return nil
+		}
+		return c.reply(h, bad)
+	} else {
+		defer rel()
+	}
+	defer c.syncCursors()
+
 	switch name {
 	case "hello", "isMaster", "ismaster":
 		return c.reply(h, c.hello(m.Body))
@@ -100,6 +110,9 @@ func (c *conn) ensureUp() error {
 
 // forward sends a rewritten command upstream and relays the reply.
 func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMoreID int64) error {
+	if err := c.applyMaxTime(res); err != nil {
+		return c.reply(h, toErrorDoc(err))
+	}
 	if err := c.ensureUp(); err != nil {
 		c.log.Error("upstream dial failed", "err", err)
 		c.s.M.Command(res.Command, "error")
@@ -152,6 +165,9 @@ func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMore
 	if rh.OpCode != wire.OpMsg {
 		return errors.New("unexpected upstream opcode")
 	}
+	if c.lim != nil && c.lim.L.MaxResultBytes > 0 && len(rb) > c.lim.L.MaxResultBytes {
+		return c.oversize(h, rb, res, getMoreID)
+	}
 	needParse := res.Post != nil || res.Alias != "" || len(res.After) > 0 || tracksCursor(res.Command)
 	if needParse {
 		rm, err := wire.ParseMsg(rb)
@@ -176,9 +192,15 @@ func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMore
 			c.noteViewCursor(rm.Body, res.Phys, getMoreID)
 		}
 		c.trackCursor(res.Command, getMoreID, rm.Body)
+		if res.IDCursor {
+			c.noteIDCursor(res.Command, getMoreID, rm.Body)
+		}
 	}
 	c.s.M.Command(res.Command, "ok")
 	c.s.M.BytesOut.Add(int64(len(rb) + 16))
+	if c.lim != nil {
+		c.lim.CountReply(len(rb) + 16)
+	}
 	return wire.WriteFrame(c.nc, rh.RequestID, h.RequestID, wire.OpMsg, rb)
 }
 
@@ -228,6 +250,9 @@ func (c *conn) handleGetMore(h wire.Header, m *wire.Msg, db string) error {
 		return c.reply(h, errorDoc(43, "CursorNotFound", fmt.Sprintf("cursor id %d not found", id)))
 	}
 	res := &rewrite.Result{Command: "getMore", DB: db, Body: m.Body}
+	if c.idCursors[id] {
+		res.IDCursor, res.Post = true, c.s.rw.IDPost(c.tenant)
+	}
 	if phys, isView := c.viewPhys[id]; isView {
 		res.Body, res.Alias, res.Phys = withString(m.Body, "collection", phys), coll, phys
 	}
@@ -286,6 +311,7 @@ func (c *conn) handleKillCursors(h wire.Header, m *wire.Msg, db string) error {
 	nb[0], nb[1], nb[2], nb[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
 	for _, id := range ownedIDs {
 		delete(c.cursors, id)
+		delete(c.idCursors, id)
 	}
 	for _, id := range ownedIDs {
 		if phys, isView := c.viewPhys[id]; isView {
@@ -475,4 +501,22 @@ func writeTarget(res *rewrite.Result) string {
 		}
 	}
 	return ""
+}
+
+// noteIDCursor remembers cursors whose documents need their _id unwrapped.
+func (c *conn) noteIDCursor(cmd string, getMoreID int64, resp bsoncore.Document) {
+	cur, ok := resp.Lookup("cursor").DocumentOK()
+	if !ok {
+		return
+	}
+	id, _ := cur.Lookup("id").AsInt64OK()
+	switch {
+	case id == 0 && cmd == "getMore":
+		delete(c.idCursors, getMoreID)
+	case id != 0 && cmd != "getMore":
+		if c.idCursors == nil {
+			c.idCursors = map[int64]bool{}
+		}
+		c.idCursors[id] = true
+	}
 }

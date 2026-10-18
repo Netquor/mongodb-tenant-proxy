@@ -83,6 +83,47 @@ type Tenant struct {
 	Field string `json:"field,omitempty"`
 	// IDType is "string" (default), "objectId" or "int".
 	IDType string `json:"idType,omitempty"`
+
+	// IDPolicy controls how document _id values are kept apart between
+	// tenants: "native" (default), "require-generated" or "namespace".
+	IDPolicy string `json:"idPolicy,omitempty"`
+	// ExperimentalNamespace must be set to use idPolicy "namespace", which has
+	// documented functional limits (see README).
+	ExperimentalNamespace bool `json:"experimentalNamespace,omitempty"`
+
+	// Limits are the default per-tenant quotas; Overrides replace individual
+	// fields for named tenants. All zero values mean "unlimited".
+	Limits    Limits            `json:"limits,omitempty"`
+	Overrides map[string]Limits `json:"overrides,omitempty"`
+}
+
+// Limits are per-tenant quotas. Zero means unlimited / not enforced.
+type Limits struct {
+	// OpsPerSec/OpsBurst: token bucket over commands (burst defaults to one
+	// second's worth).
+	OpsPerSec float64 `json:"opsPerSec,omitempty"`
+	OpsBurst  int     `json:"opsBurst,omitempty"`
+	// BytesPerSec/BytesBurst: token bucket over request + reply bytes.
+	BytesPerSec int64 `json:"bytesPerSec,omitempty"`
+	BytesBurst  int64 `json:"bytesBurst,omitempty"`
+	// MaxOpenCursors caps cursors open at once across the tenant's connections.
+	MaxOpenCursors int `json:"maxOpenCursors,omitempty"`
+	// MaxIndexes caps distinct indexes the tenant may create via the proxy
+	// (counted in memory; resets on restart).
+	MaxIndexes int `json:"maxIndexes,omitempty"`
+	// MaxCommandBytes caps a single command message; MaxResultBytes a single reply.
+	MaxCommandBytes int `json:"maxCommandBytes,omitempty"`
+	MaxResultBytes  int `json:"maxResultBytes,omitempty"`
+	// MaxTimeMSCap clamps client maxTimeMS values; DefaultMaxTimeMS is applied
+	// when a read command specifies none.
+	MaxTimeMSCap     int64 `json:"maxTimeMSCap,omitempty"`
+	DefaultMaxTimeMS int64 `json:"defaultMaxTimeMS,omitempty"`
+	// MaxInFlight caps commands executing concurrently for the tenant.
+	MaxInFlight int `json:"maxInFlight,omitempty"`
+	// DisableJS forbids this tenant from server-side JavaScript; JSPerSec caps
+	// how many JavaScript-using commands per second it may run.
+	DisableJS bool    `json:"disableJS,omitempty"`
+	JSPerSec  float64 `json:"jsPerSec,omitempty"`
 }
 
 // Auth selects how a connection learns its tenant.
@@ -138,6 +179,28 @@ func Load(path string) (*Config, error) {
 	return c, nil
 }
 
+// CheckIDPolicy validates tenant.idPolicy and switches off the features the
+// "namespace" policy cannot support. It is idempotent.
+func (c *Config) CheckIDPolicy() error {
+	switch c.Tenant.IDPolicy {
+	case "", "native", "require-generated":
+	case "namespace":
+		if !c.Tenant.ExperimentalNamespace {
+			return fmt.Errorf("tenant.idPolicy=namespace is experimental; set tenant.experimentalNamespace=true to enable it")
+		}
+		// Unwrapping _id is not implemented for these paths, so they are off.
+		c.ChangeStreams.Disabled = true
+		c.DisableViews = true
+	default:
+		return fmt.Errorf("tenant.idPolicy must be one of native, require-generated, namespace")
+	}
+	return nil
+}
+
+// Validate applies defaults and checks a Config built in code (Load does the
+// same for files).
+func Validate(c *Config) error { return c.finish() }
+
 func (c *Config) finish() error {
 	if c.Listen == "" {
 		c.Listen = ":27018"
@@ -172,6 +235,14 @@ func (c *Config) finish() error {
 	}
 	if u.AuthSource == "" {
 		u.AuthSource = "admin"
+	}
+	if err := c.CheckIDPolicy(); err != nil {
+		return err
+	}
+	for id := range c.Tenant.Overrides {
+		if id == "" {
+			return fmt.Errorf("tenant.overrides: empty tenant id")
+		}
 	}
 	switch c.Auth.Mode {
 	case "scram":
@@ -208,4 +279,54 @@ func (c *Config) DialDuration() time.Duration {
 		return d
 	}
 	return 10 * time.Second
+}
+
+// LimitsFor returns the effective limits of a tenant: the defaults with any
+// non-zero override fields applied.
+func (c *Config) LimitsFor(tenant string) Limits {
+	l := c.Tenant.Limits
+	o, ok := c.Tenant.Overrides[tenant]
+	if !ok {
+		return l
+	}
+	if o.OpsPerSec != 0 {
+		l.OpsPerSec = o.OpsPerSec
+	}
+	if o.OpsBurst != 0 {
+		l.OpsBurst = o.OpsBurst
+	}
+	if o.BytesPerSec != 0 {
+		l.BytesPerSec = o.BytesPerSec
+	}
+	if o.BytesBurst != 0 {
+		l.BytesBurst = o.BytesBurst
+	}
+	if o.MaxOpenCursors != 0 {
+		l.MaxOpenCursors = o.MaxOpenCursors
+	}
+	if o.MaxIndexes != 0 {
+		l.MaxIndexes = o.MaxIndexes
+	}
+	if o.MaxCommandBytes != 0 {
+		l.MaxCommandBytes = o.MaxCommandBytes
+	}
+	if o.MaxResultBytes != 0 {
+		l.MaxResultBytes = o.MaxResultBytes
+	}
+	if o.MaxTimeMSCap != 0 {
+		l.MaxTimeMSCap = o.MaxTimeMSCap
+	}
+	if o.DefaultMaxTimeMS != 0 {
+		l.DefaultMaxTimeMS = o.DefaultMaxTimeMS
+	}
+	if o.MaxInFlight != 0 {
+		l.MaxInFlight = o.MaxInFlight
+	}
+	if o.DisableJS {
+		l.DisableJS = true
+	}
+	if o.JSPerSec != 0 {
+		l.JSPerSec = o.JSPerSec
+	}
+	return l
 }

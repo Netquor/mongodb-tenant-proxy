@@ -15,6 +15,7 @@ import (
 	"github.com/netquor/mongodb-tenant-proxy/internal/auth"
 	"github.com/netquor/mongodb-tenant-proxy/internal/config"
 	"github.com/netquor/mongodb-tenant-proxy/internal/fanout"
+	"github.com/netquor/mongodb-tenant-proxy/internal/limits"
 	"github.com/netquor/mongodb-tenant-proxy/internal/metrics"
 	"github.com/netquor/mongodb-tenant-proxy/internal/rewrite"
 	"github.com/netquor/mongodb-tenant-proxy/internal/upstream"
@@ -30,6 +31,8 @@ type Server struct {
 	M    *metrics.Registry
 
 	limits helloLimits
+	lim    *limits.Manager
+	sess   *sessionTable
 
 	nextID atomic.Int64
 	mu     sync.Mutex
@@ -54,6 +57,9 @@ type helloLimits struct {
 
 // New builds a Server and probes the upstream to learn its wire versions.
 func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
+	if err := cfg.CheckIDPolicy(); err != nil {
+		return nil, err
+	}
 	a, err := auth.New(cfg.Auth)
 	if err != nil {
 		return nil, err
@@ -70,6 +76,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		M:      metrics.New(),
 		conns:  map[*conn]struct{}{},
 		tenant: map[string]int{},
+		lim:    limits.NewManager(cfg, nil),
 	}
 	s.rw = rewrite.New(rewrite.Config{
 		Field:         cfg.Tenant.Field,
@@ -77,6 +84,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		DenyCommands:  cfg.DenyCommands,
 		AllowJS:       !cfg.DisableJS,
 		ChangeStreams: !cfg.ChangeStreams.Disabled,
+		IDPolicy:      cfg.Tenant.IDPolicy,
 		AtomicOut:     s.txnSupported,
 	})
 	if cs := cfg.ChangeStreams; !cs.Disabled && !cs.DisableFanout {
@@ -102,6 +110,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		maxWire:        get("maxWireVersion", 17),
 		sessionTimeout: get("logicalSessionTimeoutMinutes", 30),
 	}
+	s.sess = newSessionTable(s.limits.sessionTimeout, nil)
 	log.Info("upstream reachable", "addr", cfg.Upstream.Addr, "maxWireVersion", s.limits.maxWire)
 	return s, nil
 }

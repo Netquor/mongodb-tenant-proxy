@@ -110,17 +110,90 @@ See [`proxy.example.json`](proxy.example.json). Metrics (`/metrics`, Prometheus 
 * One goroutine and one dedicated upstream connection per client connection (cursors, sessions and transactions keep native semantics). Unmodified replies are forwarded as raw bytes.
 * Measured on a laptop over loopback: point `findOne` ≈24 µs through the proxy vs ≈16 µs direct.
 
+## `_id` uniqueness (`tenant.idPolicy`)
+
+All tenants share each physical collection and MongoDB's `_id` index is unique per collection, so by default two tenants cannot use the same natural `_id`, and the duplicate-key error tells the second tenant that the first one has such a document. `tenant.idPolicy` selects how to deal with that:
+
+| policy | behaviour |
+| --- | --- |
+| `native` (default) | Unchanged. Reusing another tenant's `_id` fails with a duplicate-key error. |
+| `require-generated` | `_id` must be an **ObjectId or UUID (binary subtype 4)**; anything else is rejected on insert, on upserts (filter equality, `$set`/`$setOnInsert`, replacement documents, pipeline upserts that set `_id`) and on findAndModify upserts. Collisions then need a guessed 96/122-bit value. Duplicate-key errors on `_id` are rewritten to a generic `E11000 duplicate key error` with `keyPattern`/`keyValue`/`errInfo` removed; duplicates on other (tenant-prefixed) indexes are reported as before. `$merge`/`$out` get a run-time check that rejects documents whose `_id` is not an ObjectId (UUID `_id`s produced by a pipeline are refused too, because aggregation cannot test the binary subtype). |
+| `namespace` | **Experimental**, requires `"experimentalNamespace": true`. Stores `_id` as `{t: <tenant>, id: <client _id>}`, so different tenants can use any natural `_id`, and unwraps it on every supported read path. Change streams and views are switched off. |
+
+```json
+"tenant": { "field": "tenantId", "idPolicy": "require-generated" }
+"tenant": { "field": "tenantId", "idPolicy": "namespace", "experimentalNamespace": true }
+```
+
+Do not change the policy on a collection that already holds data written under another policy: existing `_id`s are not migrated.
+
+### Limits of `namespace`
+
+`namespace` rewrites queries on the way in and documents on the way out, so anything that would expose or depend on the stored form is rejected with an `Unauthorized`-style error that names the policy, rather than being silently wrong.
+
+Supported: `insert` (missing `_id` is generated as an ObjectId), `find`/`count`/`distinct`/`aggregate`/`getMore`, `update`/`delete`/`findAndModify` (including upserts) and `explain` of those. Conditions on `_id` may use equality, `$eq $ne $gt $gte $lt $lte $in $nin $exists`, `$not`, and may be combined with `$and`/`$or`/`$nor` and dotted sub-paths (`"_id.a"`). `distinct("_id")`, `upserted` ids, findAndModify `value` and cursor batches are unwrapped.
+
+Rejected:
+
+* `_id` conditions with `$regex`, `$type`, `$mod`, `$size`, `$all`, `$elemMatch`, regular-expression literals, `$expr`/`$where`/`$jsonSchema` filters, and `find` `min`/`max`.
+* Expressions that read `_id` or the whole document (`"$_id"`, `$$ROOT`, `$$CURRENT`) inside aggregation or update pipelines and projections, because they would return the wrapped value. That includes `$group: {_id: "$_id"}` and `$push: "$$ROOT"`. Grouping by other fields is fine, and `$group`'s own `_id` is returned untouched (the proxy tracks which stages produce a computed `_id`).
+* Aggregation stages that read other collections or reshape output into nested documents: `$lookup`, `$graphLookup`, `$unionWith`, `$facet`, `$merge`, `$out`, `$changeStream`; `mapReduce`; views; change streams (database- and collection-level).
+* Updates that write `_id` (`$set`, `$setOnInsert`, `$rename`, pipeline stages); pipeline-style and replacement upserts whose filter does not pin `_id` by equality (operator-style upserts are fine: the proxy adds a wrapped `$setOnInsert` `_id`).
+* Server-side JavaScript in aggregation (it could read `this._id`).
+
+Semantic differences to be aware of: range operators (`$gt` …) compare the wrapper as a whole, so unlike native queries they are not restricted to values of the operand's BSON type; sort order by `_id` follows BSON order of the unwrapped value within one tenant; documents are about 25 bytes larger; direct access to the database shows wrapped ids; partial or collated indexes that mention `_id` are not rewritten.
+
+## Sessions
+
+A logical session id (`lsid.id`) is a bearer token on the upstream server, which authenticates the proxy rather than the tenant, so another tenant who knew a session id could continue its transactions and retryable writes. The proxy keeps a shared table `lsid → tenant` (first use wins). Every command carrying an `lsid`, and every id listed in `endSessions`, `refreshSessions` or `killSessions`, is checked: a session owned by another tenant is refused with `Unauthorized` (`tenant proxy: session is not accessible`), which covers `commitTransaction`/`abortTransaction`, `getMore` and writes alike. A request that lists any foreign session is rejected as a whole and binds nothing. Malformed `lsid` values are rejected.
+
+Bindings are refreshed on every use and expire `logicalSessionTimeoutMinutes` of the upstream (default 30) plus 10 minutes after the last use (mongod reaps expired sessions lazily); a tenant may hold at most 100 000 sessions. Rejections are counted in `mtp_session_rejections_total{tenant}`. The table lives in the proxy process: run replicas behind a router that keeps a client on one proxy, or accept that a restart forgets bindings (sessions upstream outlive the proxy, so right after a restart the first tenant to present an id would claim it; ids are 122-bit random, so this requires the id to leak).
+
+## Quotas (`tenant.limits`)
+
+Defaults live in `tenant.limits`; `tenant.overrides.<tenantId>` replaces individual fields for one tenant (zero or absent = inherit). Everything is unlimited unless set.
+
+```json
+"tenant": {
+  "field": "tenantId",
+  "limits": {
+    "opsPerSec": 500, "opsBurst": 1000,
+    "bytesPerSec": 52428800,
+    "maxOpenCursors": 100,
+    "maxIndexes": 20,
+    "maxCommandBytes": 16777216, "maxResultBytes": 33554432,
+    "maxTimeMSCap": 60000, "defaultMaxTimeMS": 30000,
+    "maxInFlight": 64,
+    "jsPerSec": 5
+  },
+  "overrides": { "acme": { "opsPerSec": 5000, "disableJS": true } }
+}
+```
+
+| field | meaning |
+| --- | --- |
+| `opsPerSec`, `opsBurst` | Token bucket over commands (burst defaults to one second). `hello`, `ping` and SASL are exempt. |
+| `bytesPerSec`, `bytesBurst` | Token bucket over request plus reply bytes. A single large message is admitted and put the bucket into debt, so the tenant is throttled afterwards rather than being unable to send it. |
+| `maxOpenCursors` | Cursors open at once across all the tenant's connections (released on exhaustion, `killCursors` and disconnect). |
+| `maxIndexes` | Distinct indexes created through the proxy (counted in memory, so the count restarts from zero with the proxy; re-creating an existing index is free, `dropIndexes` gives the slot back). |
+| `maxCommandBytes`, `maxResultBytes` | Largest accepted command message / largest upstream reply. An oversized reply is replaced by an error and its cursor is killed; use a smaller `batchSize` or a projection. |
+| `maxTimeMSCap`, `defaultMaxTimeMS` | Client `maxTimeMS` values (including `0` = unlimited) are clamped to the cap; reads, `findAndModify`, `mapReduce` and `createIndexes` without `maxTimeMS` get the default. Change streams and `getMore` are left alone. |
+| `maxInFlight` | Commands executing at the same time for the tenant (`getMore` is exempt so long-polling tails don't hold slots). |
+| `disableJS`, `jsPerSec` | Forbid server-side JavaScript (`$where`, `$function`, `$accumulator`, `mapReduce`) for the tenant, or cap commands that use it. The global `disableJS` still switches it off for everyone. |
+
+Rejections return `code: 8000`, `codeName: "TenantQuotaExceeded"` and a message naming the quota, and are counted in `mtp_quota_rejections_total{tenant,reason}` (reasons: `ops_rate`, `bytes_rate`, `open_cursors`, `indexes`, `in_flight`, `command_size`, `result_size`, `js_disabled`, `js_rate`). Gauges `mtp_open_cursors{tenant}` and `mtp_inflight_operations{tenant}` show current usage. Limits are per proxy process.
+
 ## Requirements and limitations
 
 * MongoDB **5.0+** (uses `$lookup` with both `localField` and `pipeline`). Transactions and retryable writes need a replica-set upstream, like with any driver.
-* `_id` is unique per *collection*, not per tenant. Use generated ObjectIds/UUIDs; a natural `_id` reused by two tenants will collide (and reveals existence).
+* `_id` is unique per *collection*, not per tenant unless you pick an [`idPolicy`](#_id-uniqueness-tenantidpolicy). With the default (`native`) a natural `_id` reused by two tenants collides (and reveals existence).
 * Indexes are shared physical objects: one tenant creating an index affects all; `dropIndexes: "*"` is refused. Deny `createIndexes`/`dropIndexes` via `denyCommands` if tenants must not manage indexes. TTL indexes cannot carry the tenant prefix, so they are made tenant-private instead: the proxy adds the tenant to the index's `partialFilterExpression` (expiry only ever deletes the creator's documents) and appends a `__mtp_t<tag>` suffix to the index name (shown by `listIndexes`, used by `dropIndexes`); unique TTL indexes are refused. Other tenants' private indexes are hidden from `listIndexes`.
 * `create` accepts no collection options (`capped`, `validator`, `collation`, `clusteredIndex`, ...) because the physical collection is shared. Collations weaker than strength 3 (or `alternate: shifted`, `numericOrdering`) are rejected on every command, since they could make one tenant id compare equal to another. A default collation set out of band on a shared collection has the same effect and must be avoided.
 * Requests are validated before rewriting: malformed BSON, nesting deeper than 100 levels and pipelines longer than 1000 stages are rejected, and server-side JavaScript (`$where`, `$function`, `$accumulator`) is refused anywhere in a command when `disableJS` is set.
 * The `tenantId` field is visible in returned documents.
 * `listCollections` filters other than `name`/`type` don't apply to views.
 * No wire compression (not advertised), no `SCRAM-SHA-1`/x.509 on the client side.
-* Session ids (`lsid`) are unguessable UUIDs but are not bound to a tenant.
+* Session ids are bound to the first tenant that uses them ([Sessions](#sessions)); quotas are per proxy process, not shared between proxy replicas ([Quotas](#quotas-tenantlimits)).
 
 ## Tests
 

@@ -15,6 +15,7 @@ import (
 
 	"github.com/netquor/mongodb-tenant-proxy/internal/auth"
 	"github.com/netquor/mongodb-tenant-proxy/internal/fanout"
+	"github.com/netquor/mongodb-tenant-proxy/internal/limits"
 	"github.com/netquor/mongodb-tenant-proxy/internal/rewrite"
 	"github.com/netquor/mongodb-tenant-proxy/internal/upstream"
 	"github.com/netquor/mongodb-tenant-proxy/internal/wire"
@@ -33,14 +34,19 @@ type conn struct {
 
 	tenant     *rewrite.Tenant
 	tenantHeld bool
-	sasl       *auth.SASL
+	lim        *limits.Tenant // quota state of the bound tenant
+	// cursorsCharged is how many of c.cursors are counted in lim.
+	cursorsCharged int
+	sasl           *auth.SASL
 
 	up       *upstream.Conn
-	cursors  map[int64]string      // cursor id -> namespace it was opened on
-	viewPhys map[int64]string      // view cursor id -> physical view collection
-	streams  map[int64]*fanout.Sub // virtual change stream cursors served by the fan-out
-	outID    int32
-	upAddr   string // local address of the upstream connection ($currentOp attribution)
+	cursors  map[int64]string // cursor id -> namespace it was opened on
+	viewPhys map[int64]string // view cursor id -> physical view collection
+	// idCursors are cursors whose documents hold namespaced _id values.
+	idCursors map[int64]bool
+	streams   map[int64]*fanout.Sub // virtual change stream cursors served by the fan-out
+	outID     int32
+	upAddr    string // local address of the upstream connection ($currentOp attribution)
 }
 
 func newConn(s *Server, nc net.Conn) *conn {
@@ -122,6 +128,10 @@ func (c *conn) cleanup() {
 		c.up.Close()
 	}
 	c.nc.Close()
+	if c.lim != nil {
+		c.cursors = nil
+		c.syncCursors()
+	}
 	if c.tenantHeld {
 		c.s.releaseTenant(c.tenant.ID)
 	}
@@ -165,6 +175,7 @@ func (c *conn) bindTenant(id string) error {
 		c.s.releaseTenant(c.tenant.ID)
 	}
 	c.tenant, c.tenantHeld = t, true
+	c.lim = c.s.lim.For(id)
 	c.log = c.log.With("tenant", id)
 	return nil
 }
@@ -177,6 +188,9 @@ func (c *conn) reply(h wire.Header, d bsoncore.Document) error {
 	m := wire.Msg{Body: d}
 	b := m.Encode()
 	c.s.M.BytesOut.Add(int64(len(b) + 16))
+	if c.lim != nil {
+		c.lim.CountReply(len(b) + 16)
+	}
 	return wire.WriteFrame(c.nc, c.nextRequestID(), h.RequestID, wire.OpMsg, b)
 }
 
