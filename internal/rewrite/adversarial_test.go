@@ -321,15 +321,15 @@ func adversarialCases() []advCase {
 	add("facet/collStats inside", agg(M{"$facet": M{"a": A{M{"$collStats": M{}}}}}), true)
 	add("facet/$accumulator in $group", agg(M{"$facet": M{"a": A{M{"$group": M{"_id": nil, "x": M{"$accumulator": M{"init": "x", "accumulate": "x", "accumulateArgs": A{}, "merge": "x", "lang": "js"}}}}}}}), true)
 	add("facet/duplicate branch names", agg(M{"$facet": rawElems(rawArr("a"), rawArr("a"))}), false)
-	add("stage/$collStats", agg(M{"$collStats": M{"storageStats": M{}}}), true)
+	add("stage/$collStats", agg(M{"$collStats": M{"storageStats": M{}}}), false) // tenant-scoped stats (admin-cmds)
 	add("stage/$indexStats", agg(M{"$indexStats": M{}}), true)
 	add("stage/$currentOp", agg(M{"$currentOp": M{}}), true)
 	add("stage/$listSessions", agg(M{"$listSessions": M{"allUsers": true}}), true)
 	add("stage/$listLocalSessions", agg(M{"$listLocalSessions": M{"allUsers": true}}), true)
 	add("stage/$planCacheStats", agg(M{"$planCacheStats": M{}}), true)
 	add("stage/$documents", agg(M{"$documents": A{M{"a": 1}}}), true)
-	add("stage/$search", agg(M{"$search": M{"text": M{"query": "x", "path": "a"}}}), true)
-	add("stage/$vectorSearch", agg(M{"$vectorSearch": M{}}), true)
+	add("stage/$search", agg(M{"$search": M{"text": M{"query": "x", "path": "a"}}}), false) // tenant filter injected
+	add("stage/$vectorSearch", agg(M{"$vectorSearch": M{}}), false) // tenant filter injected
 	add("stage/$unknown", agg(M{"$nope": M{}}), true)
 	add("stage/$out not last", agg(M{"$out": "x"}, M{"$limit": 1}), true)
 	add("stage/$merge not last", agg(M{"$merge": "x"}, M{"$limit": 1}), true)
@@ -696,7 +696,7 @@ func adversarialCases() []advCase {
 	add("coll/dots", withDB(D{s1("find", "a.b.c")}), false)
 
 	// ---- commands ---------------------------------------------------------------
-	for _, c := range []string{"dropDatabase", "dropAllUsersFromDatabase", "createUser", "grantRolesToUser", "shutdown", "fsync", "killOp", "currentOp", "renameCollection", "copydb", "eval", "$eval", "applyOps", "replSetGetStatus", "collMod", "compact", "reIndex", "validate", "dbStats", "collStats", "serverStatus", "getParameter", "setParameter", "profile", "getLog", "listCommands", "authenticate", "saslStart", "hello", "bulkWrite", "getMore", "killCursors", "FIND", "Find", "insert ", "_id"} {
+	for _, c := range []string{"dropAllUsersFromDatabase", "createUser", "grantRolesToUser", "shutdown", "fsync", "killOp", "renameCollection", "copydb", "eval", "$eval", "applyOps", "replSetGetStatus", "collMod", "compact", "reIndex", "validate", "collStats", "getParameter", "setParameter", "profile", "getLog", "listCommands", "authenticate", "saslStart", "hello", "bulkWrite", "getMore", "killCursors", "FIND", "Find", "insert ", "_id"} {
 		add("cmd/"+strings.ReplaceAll(c, "\x00", "<NUL>"), withDB(D{s1(c, 1)}), true)
 	}
 	add("cmd/ping", withDB(D{s1("ping", 1)}), false)
@@ -707,7 +707,7 @@ func adversarialCases() []advCase {
 	add("cmd/admin passthrough with seq", withDB(D{s1("ping", 1)}), true)
 	cs[len(cs)-1].cmd = withDB(D{s1("endSessions", A{})})
 	cs[len(cs)-1].seqs = []wire.Seq{seqOf("documents", M{"a": 1})}
-	add("cmd/mapReduce to collection", withDB(D{s1("mapReduce", "c"), s1("out", "x")}), true)
+	add("cmd/mapReduce to collection", withDB(D{s1("mapReduce", "c"), s1("out", "x")}), true) // JS disabled in this config; output to a collection is tenant-scoped when JS is on
 	add("cmd/mapReduce without out", withDB(D{s1("mapReduce", "c")}), true)
 	return cs
 }

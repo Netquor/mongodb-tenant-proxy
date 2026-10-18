@@ -138,11 +138,11 @@ func TestNamespaceAggregateUnwrapState(t *testing.T) {
 func TestUnwrapReply(t *testing.T) {
 	r := nsRewriter()
 	ten, _ := NewTenant("string", "T1")
-	w := bson.M{"t": "T1", "id": 9}
+	w := bson.D{{Key: "t", Value: "T1"}, {Key: "id", Value: 9}}
 	resp := mk(t, bson.D{
 		{Key: "cursor", Value: bson.D{{Key: "firstBatch", Value: bson.A{
 			bson.D{{Key: "_id", Value: w}, {Key: "a", Value: 1}},
-			bson.D{{Key: "_id", Value: bson.M{"t": "OTHER", "id": 1}}}, // not ours: untouched
+			bson.D{{Key: "_id", Value: bson.D{{Key: "t", Value: "OTHER"}, {Key: "id", Value: 1}}}}, // not ours: untouched
 		}}, {Key: "id", Value: int64(0)}}},
 		{Key: "ok", Value: 1},
 	})

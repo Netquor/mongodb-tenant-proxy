@@ -549,7 +549,8 @@ func (r *Rewriter) cmdAggregate(q *request) (*Result, error) {
 		return nil, err
 	}
 	ex := &extras{db: q.db}
-	if st, err := q.body.Lookup("pipeline").Array().Values(); err == nil && len(st) > 0 {
+	if pa, ok := q.body.Lookup("pipeline").ArrayOK(); !ok {
+	} else if st, err := pa.Values(); err == nil && len(st) > 0 {
 		if d, ok := st[0].DocumentOK(); ok {
 			if e, err := d.IndexErr(0); err == nil {
 				switch e.Key() {

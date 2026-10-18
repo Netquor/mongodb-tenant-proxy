@@ -133,6 +133,12 @@ func (g *guard) pipeline(a bsoncore.Array, injected, top bool) error {
 				}
 			case "$geoNear":
 				// checked below; query must be guarded
+			case "$search", "$vectorSearch":
+				// Atlas Search stages must start the pipeline, so the tenant
+				// filter is injected into the stage itself.
+				if !strings.Contains(spec.String(), g.r.field) {
+					return fmt.Errorf("%s lacks the tenant filter", name)
+				}
 			case "$changeStream":
 				if i+1 >= len(stages) {
 					return fmt.Errorf("$changeStream without tenant $match")
@@ -293,6 +299,10 @@ func (g *guard) pipeline(a bsoncore.Array, injected, top bool) error {
 			if err := g.noJS(spec); err != nil {
 				return err
 			}
+		case name == "$search" || name == "$vectorSearch":
+			if i != 0 || !strings.Contains(spec.String(), g.r.field) {
+				return fmt.Errorf("%s must be first and carry the tenant filter", name)
+			}
 		default:
 			return fmt.Errorf("stage %s must not appear in output", name)
 		}
@@ -422,6 +432,9 @@ func safeCollation(v bsoncore.Value) bool {
 func (g *guard) check(cmd string, res *Result, seqs []wire.Seq) error {
 	if res.Reply != nil {
 		return res.Reply.Validate()
+	}
+	if res.Run != nil {
+		return nil // executed by the proxy against the upstream; covered by admin_test.go and the integration tests
 	}
 	if err := res.Body.Validate(); err != nil {
 		return fmt.Errorf("invalid BSON body: %w", err)
