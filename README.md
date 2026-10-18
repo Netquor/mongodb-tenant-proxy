@@ -100,7 +100,14 @@ Replies up to `streaming.thresholdBytes` (default 256 KiB) are read into memory.
 
 Benchmark (`go test ./internal/proxy -bench RelayLargeBatch -benchmem`, Apple M4, loopback-free pure relay of one batch of 1 KiB documents):
 
-BENCH_TABLE
+| batch | mode | time/op | allocated/op | peak heap |
+|---|---|---|---|---|
+| 1 MiB | buffered (before) | 235 µs | 2.1 MB | 7 MiB |
+| 1 MiB | streaming | 91 µs | 352 B | 0.03 MiB |
+| 8 MiB | buffered (before) | 1.47 ms | 17 MB | 16 MiB |
+| 8 MiB | streaming | 0.73 ms | 352 B | 0.03 MiB |
+| 32 MiB | buffered (before) | 6.5 ms | 68 MB | 130 MiB |
+| 32 MiB | streaming | 4.0 ms | 352 B | 0.03 MiB |
 
 ## Run
 
@@ -125,7 +132,7 @@ See [`proxy.example.json`](proxy.example.json). Metrics (`/metrics`, Prometheus 
 * The `tenantId` field is visible in returned documents.
 * `mapReduce` can't write to a collection (use `$merge`); `listCollections` filters other than `name`/`type` don't apply to views.
 * No wire compression (not advertised), no `SCRAM-SHA-1`/x.509 on the client side.
-* Upstream routing: `hedge` reads, `readPreferenceTags` in the connection string (clients send tags per command, which is honoured), SRV (`mongodb+srv://`) upstream URIs, and load-balanced mode are not supported. `exhaust` (moreToCome) cursors are not enabled upstream; clients fall back to ordinary getMore. If the primary changes mid-cursor on a *primary* read, the cursor is lost with the old primary, as on a real server.
+* Upstream routing: `hedge` reads, a proxy-side default read preference (only what the client sends per command is honoured), SRV (`mongodb+srv://`) upstream URIs, and load-balanced mode are not supported. `exhaust` (moreToCome) cursors are not enabled upstream; clients fall back to ordinary getMore. If the primary changes mid-cursor on a *primary* read, the cursor is lost with the old primary, as on a real server.
 * Session ids (`lsid`) are unguessable UUIDs but are not bound to a tenant.
 
 ## Tests

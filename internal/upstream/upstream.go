@@ -68,7 +68,7 @@ type Dialer struct {
 	hosts  map[string]*hostTLS // per-member TLS overrides
 	hostRW map[string]string
 	topo   *topology
-	logger *slog.Logger
+	logger atomic.Pointer[slog.Logger]
 
 	started      atomic.Bool
 	open         atomic.Int64 // live sockets of any kind
@@ -83,11 +83,11 @@ type hostTLS struct {
 }
 
 // SetLogger sets the logger used for topology events.
-func (d *Dialer) SetLogger(l *slog.Logger) { d.logger = l }
+func (d *Dialer) SetLogger(l *slog.Logger) { d.logger.Store(l) }
 
 func (d *Dialer) log(msg string, args ...any) {
-	if d.logger != nil {
-		d.logger.Info(msg, args...)
+	if l := d.logger.Load(); l != nil {
+		l.Info(msg, args...)
 	}
 }
 
@@ -388,6 +388,7 @@ func appendDB(cmd bsoncore.Document, db string) bsoncore.Document {
 // Hello waits for a member to answer and returns its hello reply, used to
 // learn wire versions and limits. The primary is preferred.
 func (d *Dialer) Hello(ctx context.Context) (bsoncore.Document, error) {
+	d.topo.settled(ctx, 3*time.Second)
 	m, err := d.topo.selectMember(ctx, Selector{Mode: PrimaryPreferred})
 	if err != nil {
 		return nil, err

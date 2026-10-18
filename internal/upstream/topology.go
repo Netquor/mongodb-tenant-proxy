@@ -59,6 +59,7 @@ type member struct {
 	pool *memberPool
 
 	desc     ServerDesc // guarded by t.mu
+	checked  bool       // the monitor has completed its first probe (guarded by t.mu)
 	check    chan struct{}
 	stop     chan struct{}
 	inflight atomic.Int32
@@ -323,6 +324,7 @@ func (t *topology) update(m *member, nd ServerDesc) bool {
 		return false
 	}
 	old := m.desc
+	m.checked = true
 	remove := func() bool {
 		t.removeMemberLocked(m.addr)
 		t.broadcastLocked()
@@ -387,6 +389,30 @@ func (t *topology) update(m *member, nd ServerDesc) bool {
 	}
 	t.broadcastLocked()
 	return true
+}
+
+// settled waits (bounded) until every known member has been probed once, so
+// the first selection sees the whole set rather than whoever answered first.
+func (t *topology) settled(ctx context.Context, max time.Duration) {
+	ctx, cancel := context.WithTimeout(ctx, max)
+	defer cancel()
+	for {
+		t.mu.Lock()
+		all := true
+		for _, m := range t.members {
+			all = all && m.checked
+		}
+		ch := t.changed
+		t.mu.Unlock()
+		if all {
+			return
+		}
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (t *topology) addHostsLocked(hosts []string) {

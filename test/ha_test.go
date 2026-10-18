@@ -17,6 +17,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 
 	"github.com/netquor/mongodb-tenant-proxy/internal/config"
+	"github.com/netquor/mongodb-tenant-proxy/internal/upstream"
 )
 
 // tenantOpts returns a client for the tenant with extra options applied.
@@ -33,6 +34,8 @@ func (e *env) tenantOpts(t testing.TB, id string, mut func(*options.ClientOption
 	t.Cleanup(func() { c.Disconnect(context.Background()) })
 	return c
 }
+
+type upstreamStats = upstream.Stats
 
 func majority() *writeconcern.WriteConcern { return writeconcern.Majority() }
 
@@ -59,13 +62,21 @@ func TestReplicaSet(t *testing.T) {
 	e := attachProxy(t, addrs, func(c *config.Config) { c.Upstream.Pool.MaxSize = 4 })
 
 	t.Run("discovery", func(t *testing.T) {
-		st := e.srv.UpstreamStats()
-		types := map[string]int{}
-		for _, m := range st.Members {
-			types[m.Type]++
-		}
-		if types["RSPrimary"] != 1 || types["RSSecondary"] != 2 {
-			t.Fatalf("members: %+v", st.Members)
+		var st upstreamStats
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			st = e.srv.UpstreamStats()
+			types := map[string]int{}
+			for _, m := range st.Members {
+				types[m.Type]++
+			}
+			if types["RSPrimary"] == 1 && types["RSSecondary"] == 2 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("members: %+v", st.Members)
+			}
+			time.Sleep(50 * time.Millisecond)
 		}
 		// A client sees one standalone-looking endpoint, never the members.
 		c := e.tenant(t, "disc")
