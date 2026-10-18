@@ -18,6 +18,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 
 	"github.com/netquor/mongodb-tenant-proxy/internal/upstream"
+	"github.com/netquor/mongodb-tenant-proxy/internal/wire"
 )
 
 const (
@@ -377,7 +378,7 @@ func (h *hub) dispatch(batch bsoncore.Array, pbrt bsoncore.Document, token *bson
 			*token = id
 		}
 		if h.coll == "" {
-			if c, _ := ev.Lookup("ns", "coll").StringValueOK(); strings.HasPrefix(c, "__mtp_") {
+			if c, _ := wire.LookupPath(ev, "ns", "coll").StringValueOK(); strings.HasPrefix(c, "__mtp_") {
 				continue // proxy bookkeeping, never shown to tenants
 			}
 		}

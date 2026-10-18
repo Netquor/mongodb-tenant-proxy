@@ -312,7 +312,7 @@ func (c *conn) helloDoc(legacy bool) bsoncore.Document {
 
 func (c *conn) hello(req bsoncore.Document) bsoncore.Document {
 	if c.s.auth.Mode() == "appname" && c.tenant == nil {
-		if name, ok := req.Lookup("client", "application", "name").StringValueOK(); ok {
+		if name, ok := wire.LookupPath(req, "client", "application", "name").StringValueOK(); ok {
 			id, err := c.s.auth.ResolveAppName(name)
 			if err == nil {
 				err = c.bindTenant(id)
@@ -382,7 +382,7 @@ func (c *conn) handleSASL(name string, cmd bsoncore.Document) bsoncore.Document 
 		if mech, _ := cmd.Lookup("mechanism").StringValueOK(); mech != "SCRAM-SHA-256" {
 			return errorDoc(334, "MechanismUnavailable", "tenant proxy: only SCRAM-SHA-256 is supported")
 		}
-		skip, _ := cmd.Lookup("options", "skipEmptyExchange").BooleanOK()
+		skip, _ := wire.LookupPath(cmd, "options", "skipEmptyExchange").BooleanOK()
 		c.sasl, out, err = c.s.auth.StartSASL(payload, skip)
 		if err != nil {
 			return fail()

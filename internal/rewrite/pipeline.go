@@ -23,6 +23,9 @@ func (r *Rewriter) scopePipeline(t *Tenant, p arr, inject bool, ex *extras) (arr
 	if err != nil {
 		return nil, badValue("malformed pipeline")
 	}
+	if len(stages) > maxPipelineStages {
+		return nil, badValue("pipeline exceeds %d stages", maxPipelineStages)
+	}
 	out := make([]value, 0, len(stages)+1)
 	scopedFirst := false
 	for i, s := range stages {
@@ -70,8 +73,8 @@ func (r *Rewriter) scopePipeline(t *Tenant, p arr, inject bool, ex *extras) (arr
 			if !r.cs {
 				return nil, deny("change streams are not enabled")
 			}
-			if !inject || i != 0 {
-				return nil, deny("$changeStream must be the first stage of a collection aggregate")
+			if !inject || i != 0 || ex == nil {
+				return nil, deny("$changeStream must be the first stage of a top-level aggregate")
 			}
 			cs, err := r.rewriteChangeStream(t, spec, ex != nil && ex.dbLevel)
 			if err != nil {

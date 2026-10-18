@@ -78,6 +78,25 @@ func WriteFrame(w io.Writer, requestID, responseTo, opCode int32, body []byte) e
 	return err
 }
 
+// LookupPath returns the value at a nested path, or a zero Value when any step
+// is missing or is not a (well-formed) document. bsoncore.Document.Lookup with
+// several keys panics when an intermediate document value is malformed, so
+// lookups on data that has not been deeply validated go through this instead.
+func LookupPath(d bsoncore.Document, path ...string) bsoncore.Value {
+	for i, k := range path {
+		v := d.Lookup(k)
+		if i == len(path)-1 {
+			return v
+		}
+		sub, ok := v.DocumentOK()
+		if !ok {
+			return bsoncore.Value{}
+		}
+		d = sub
+	}
+	return bsoncore.Value{}
+}
+
 // Seq is an OP_MSG kind-1 document sequence.
 type Seq struct {
 	ID   string
@@ -110,7 +129,7 @@ func ParseMsg(b []byte) (*Msg, error) {
 		b = b[1:]
 		switch kind {
 		case 0:
-			doc, rest, ok := bsoncore.ReadDocument(b)
+			doc, rest, ok := readDocument(b)
 			if !ok {
 				return nil, errors.New("wire: malformed OP_MSG body document")
 			}
@@ -136,7 +155,7 @@ func ParseMsg(b []byte) (*Msg, error) {
 			}
 			s := Seq{ID: id}
 			for len(rest) > 0 {
-				doc, r2, ok := bsoncore.ReadDocument(rest)
+				doc, r2, ok := readDocument(rest)
 				if !ok {
 					return nil, errors.New("wire: malformed kind-1 document")
 				}
@@ -215,7 +234,7 @@ func ParseQuery(b []byte) (*Query, error) {
 	q.Collection = name
 	q.Skip = int32(binary.LittleEndian.Uint32(rest))
 	q.Return = int32(binary.LittleEndian.Uint32(rest[4:]))
-	doc, _, ok := bsoncore.ReadDocument(rest[8:])
+	doc, _, ok := readDocument(rest[8:])
 	if !ok {
 		return nil, errors.New("wire: malformed OP_QUERY document")
 	}
@@ -229,6 +248,17 @@ func EncodeReply(doc bsoncore.Document) []byte {
 	binary.LittleEndian.PutUint32(out[0:], 8) // AwaitCapable
 	binary.LittleEndian.PutUint32(out[16:], 1)
 	return append(out, doc...)
+}
+
+// readDocument is bsoncore.ReadDocument plus the framing checks it omits: a
+// document is at least 5 bytes (it accepts a declared length of 4) and ends in
+// a NUL byte. Everything downstream may then slice off the terminator.
+func readDocument(b []byte) (bsoncore.Document, []byte, bool) {
+	d, rest, ok := bsoncore.ReadDocument(b)
+	if !ok || len(d) < 5 || d[len(d)-1] != 0 {
+		return nil, b, false
+	}
+	return d, rest, true
 }
 
 func readCString(b []byte) (string, []byte, bool) {

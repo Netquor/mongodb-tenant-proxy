@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"runtime/debug"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
@@ -80,9 +82,9 @@ func (c *conn) serve(ctx context.Context) {
 		s.M.BytesIn.Add(int64(h.Length))
 		switch h.OpCode {
 		case wire.OpMsg:
-			err = c.handleMsg(h, body)
+			err = c.safely(func() error { return c.handleMsg(h, body) })
 		case wire.OpQuery:
-			err = c.handleLegacy(h, body)
+			err = c.safely(func() error { return c.handleLegacy(h, body) })
 		default:
 			c.log.Warn("unsupported opcode", "opcode", h.OpCode)
 			return
@@ -92,6 +94,19 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// safely runs one request handler. A bug triggered by hostile input must
+// close that client's connection, not crash the proxy and with it every
+// other tenant's connections.
+func (c *conn) safely(fn func() error) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			c.log.Error("panic while handling request", "panic", p, "stack", string(debug.Stack()))
+			err = fmt.Errorf("internal error: %v", p)
+		}
+	}()
+	return fn()
 }
 
 func (c *conn) cleanup() {

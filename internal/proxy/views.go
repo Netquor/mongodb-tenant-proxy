@@ -70,7 +70,7 @@ func (c *conn) viewsIn(db string) (map[string]*viewDef, error) {
 		return nil, err
 	}
 	out := map[string]*viewDef{}
-	if batch, ok := resp.Lookup("cursor", "firstBatch").ArrayOK(); ok {
+	if batch, ok := wire.LookupPath(resp, "cursor", "firstBatch").ArrayOK(); ok {
 		vals, _ := batch.Values()
 		for _, v := range vals {
 			d, ok := v.DocumentOK()
@@ -219,7 +219,7 @@ func (c *conn) viewDDL(h wire.Header, m *wire.Msg, name, db, coll string) error 
 			bsoncore.AppendInt32Element(nil, "limit", 1),
 			bsoncore.AppendBooleanElement(nil, "singleBatch", true)))
 		if err == nil && !failed(probe) {
-			if b, _ := probe.Lookup("cursor", "firstBatch").ArrayOK(); b != nil {
+			if b, _ := wire.LookupPath(probe, "cursor", "firstBatch").ArrayOK(); b != nil {
 				if vals, _ := b.Values(); len(vals) > 0 {
 					return c.reply(h, errorDoc(48, "NamespaceExists", "Collection already exists. NS: "+db+"."+coll))
 				}
@@ -230,6 +230,9 @@ func (c *conn) viewDDL(h wire.Header, m *wire.Msg, name, db, coll string) error 
 			bsoncore.AppendStringElement(nil, "viewOn", physOn),
 			bsoncore.AppendArrayElement(nil, "pipeline", scoped))
 		if col := m.Body.Lookup("collation"); col.Type != 0 {
+			if err := rewrite.CheckCollation(col); err != nil {
+				return fail(err)
+			}
 			cmd = appendRaw(cmd, valueElem("collation", col))
 		}
 		if resp, err := c.run(db, cmd); err != nil || failed(resp) {
@@ -365,7 +368,7 @@ func (c *conn) noteViewCursor(resp bsoncore.Document, phys string, getMoreID int
 	if getMoreID != 0 {
 		return
 	}
-	if id, _ := resp.Lookup("cursor", "id").AsInt64OK(); id != 0 {
+	if id, _ := wire.LookupPath(resp, "cursor", "id").AsInt64OK(); id != 0 {
 		c.viewPhys[id] = phys
 	}
 }
