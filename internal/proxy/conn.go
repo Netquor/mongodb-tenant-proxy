@@ -33,7 +33,18 @@ type conn struct {
 	tenantHeld bool
 	sasl       *auth.SASL
 
-	up       *upstream.Conn
+	// up is the upstream connection carrying the command in progress. In
+	// pooled mode it is borrowed per command (see uplink.go); in dedicated
+	// mode it is one of this client's own per-member connections (ded).
+	up      *upstream.Conn
+	ded     map[string]*upstream.Conn // dedicated mode: member -> connection
+	txnConn *upstream.Conn            // pooled mode: connection pinned by an open transaction
+	txnBody bsoncore.Document         // abortTransaction for the open transaction
+	tails   map[int64]*upstream.Conn  // pooled mode: change-stream / tailable cursor -> pinned connection
+	rt      route                     // route of the command in progress
+	// cursorAt maps a server cursor to the member that owns it: getMore and
+	// killCursors must go back to that member.
+	cursorAt map[int64]string
 	cursors  map[int64]string      // cursor id -> namespace it was opened on
 	viewPhys map[int64]string      // view cursor id -> physical view collection
 	streams  map[int64]*fanout.Sub // virtual change stream cursors served by the fan-out
@@ -46,6 +57,9 @@ func newConn(s *Server, nc net.Conn) *conn {
 		s: s, nc: nc, id: id,
 		br:       bufio.NewReaderSize(nc, 64*1024),
 		cursors:  map[int64]string{},
+		cursorAt: map[int64]string{},
+		ded:      map[string]*upstream.Conn{},
+		tails:    map[int64]*upstream.Conn{},
 		streams:  map[int64]*fanout.Sub{},
 		viewPhys: map[int64]string{},
 		log:      s.log.With("conn", id, "remote", nc.RemoteAddr().String()),
@@ -87,6 +101,7 @@ func (c *conn) serve(ctx context.Context) {
 			c.log.Warn("unsupported opcode", "opcode", h.OpCode)
 			return
 		}
+		c.endCommand()
 		if err != nil {
 			c.log.Debug("closing connection", "err", err)
 			return
@@ -98,9 +113,23 @@ func (c *conn) cleanup() {
 	for _, sub := range c.streams {
 		sub.Close()
 	}
-	if c.up != nil {
-		c.killOpenCursors()
-		c.up.Close()
+	c.abortOpenTxn()
+	c.killOpenCursors()
+	c.up = nil
+	if c.pooled() {
+		held := map[*upstream.Conn]bool{}
+		if c.txnConn != nil {
+			held[c.txnConn] = true
+		}
+		for _, u := range c.tails {
+			held[u] = true
+		}
+		for u := range held {
+			c.s.dial.Release(u)
+		}
+	}
+	for _, u := range c.ded {
+		u.Close()
 	}
 	c.nc.Close()
 	if c.tenantHeld {
@@ -108,18 +137,33 @@ func (c *conn) cleanup() {
 	}
 }
 
-// killOpenCursors releases server-side cursors the client abandoned.
+// killOpenCursors releases server-side cursors the client abandoned, on the
+// member that owns each of them.
 func (c *conn) killOpenCursors() {
-	byNS := map[string][]int64{}
+	type key struct{ addr, ns string }
+	by := map[key][]int64{}
 	for id, ns := range c.cursors {
 		if _, virtual := c.streams[id]; virtual {
 			continue
 		}
-		byNS[ns] = append(byNS[ns], id)
+		k := key{c.cursorAt[id], ns}
+		by[k] = append(by[k], id)
 	}
-	c.up.SetDeadline(time.Now().Add(2 * time.Second))
-	for ns, ids := range byNS {
-		db, coll := splitNS(ns)
+	for k, ids := range by {
+		if k.addr == "" {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		u := c.tails[ids[0]]
+		if u == nil {
+			var err error
+			if u, err = c.acquire(ctx, k.addr); err != nil {
+				cancel()
+				continue
+			}
+		}
+		u.SetDeadline(time.Now().Add(2 * time.Second))
+		db, coll := splitNS(k.ns)
 		vals := make([]bsoncore.Value, len(ids))
 		for i, id := range ids {
 			vals[i] = bsoncore.Value{Type: bsoncore.TypeInt64, Data: bsoncore.AppendInt64(nil, id)}
@@ -128,8 +172,12 @@ func (c *conn) killOpenCursors() {
 			bsoncore.AppendStringElement(nil, "killCursors", coll),
 			bsoncore.AppendArrayElement(nil, "cursors", bsoncore.BuildArray(nil, vals...)),
 		)
-		if _, err := c.s.dial.RunCommand(c.up, db, cmd); err != nil {
-			return
+		_, err := c.s.dial.RunCommand(u, db, cmd)
+		cancel()
+		if err != nil {
+			c.failConn(u, err)
+		} else if c.tails[ids[0]] == nil && c.pooled() {
+			c.s.dial.Release(u)
 		}
 	}
 }

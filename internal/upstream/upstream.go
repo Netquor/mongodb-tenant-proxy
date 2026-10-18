@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -23,13 +24,39 @@ import (
 	"github.com/netquor/mongodb-tenant-proxy/internal/wire"
 )
 
-// Conn is an authenticated connection to the upstream server.
+// Conn is an authenticated connection to an upstream member.
 type Conn struct {
 	net.Conn
 	R *bufio.Reader
+	// Addr is the member this connection talks to.
+	Addr string
+
+	d        *Dialer
+	pool     *memberPool // nil for unpooled connections
+	gen      uint64
+	born     time.Time
+	lastUsed time.Time
+	broken   bool
+	once     sync.Once
 }
 
-// Dialer opens upstream connections.
+// MarkBroken makes the pool discard the connection instead of reusing it
+// (for example after a protocol error mid-reply).
+func (c *Conn) MarkBroken() { c.broken = true }
+
+// Close closes the socket exactly once.
+func (c *Conn) Close() error {
+	var err error
+	c.once.Do(func() {
+		err = c.Conn.Close()
+		if c.d != nil {
+			c.d.open.Add(-1)
+		}
+	})
+	return err
+}
+
+// Dialer opens, monitors and pools upstream connections.
 type Dialer struct {
 	cfg    config.Upstream
 	dial   net.Dialer
@@ -37,20 +64,57 @@ type Dialer struct {
 	max    int
 	ids    atomic.Int32
 	images sync.Map // "db.coll" -> struct{}
+
+	hosts  map[string]*hostTLS // per-member TLS overrides
+	hostRW map[string]string
+	topo   *topology
+	logger *slog.Logger
+
+	started      atomic.Bool
+	open         atomic.Int64 // live sockets of any kind
+	pooledOpened atomic.Int64
+	events       atomic.Int64 // topology changes observed
+	stopReap     chan struct{}
+	closeOnce    sync.Once
 }
 
-// NewDialer prepares a Dialer from the upstream configuration.
+type hostTLS struct {
+	cfg *tls.Config
+}
+
+// SetLogger sets the logger used for topology events.
+func (d *Dialer) SetLogger(l *slog.Logger) { d.logger = l }
+
+func (d *Dialer) log(msg string, args ...any) {
+	if d.logger != nil {
+		d.logger.Info(msg, args...)
+	}
+}
+
+func (d *Dialer) mapHost(a string) string {
+	if r, ok := d.hostRW[a]; ok {
+		return r
+	}
+	return a
+}
+
+// NewDialer prepares a Dialer from the upstream configuration and starts
+// monitoring the members.
 func NewDialer(cfg *config.Config) (*Dialer, error) {
-	d := &Dialer{cfg: cfg.Upstream, max: cfg.MaxMessageBytes}
+	d := &Dialer{cfg: cfg.Upstream, max: cfg.MaxMessageBytes, hosts: map[string]*hostTLS{},
+		hostRW: cfg.Upstream.HostMap, stopReap: make(chan struct{})}
 	if d.cfg.AuthSource == "" {
 		d.cfg.AuthSource = "admin"
 	}
 	d.dial.Timeout = cfg.DialDuration()
 	d.dial.KeepAlive = 30e9
-	if cfg.Upstream.TLS {
-		tc := &tls.Config{InsecureSkipVerify: cfg.Upstream.InsecureSkipVerify, MinVersion: tls.VersionTLS12}
-		if cfg.Upstream.CAFile != "" {
-			pem, err := os.ReadFile(cfg.Upstream.CAFile)
+	build := func(on bool, ca string, skip bool, name string) (*tls.Config, error) {
+		if !on {
+			return nil, nil
+		}
+		tc := &tls.Config{InsecureSkipVerify: skip, MinVersion: tls.VersionTLS12, ServerName: name}
+		if ca != "" {
+			pem, err := os.ReadFile(ca)
 			if err != nil {
 				return nil, err
 			}
@@ -60,21 +124,88 @@ func NewDialer(cfg *config.Config) (*Dialer, error) {
 			}
 			tc.RootCAs = pool
 		}
-		d.tls = tc
+		return tc, nil
 	}
+	var err error
+	if d.tls, err = build(cfg.Upstream.TLS, cfg.Upstream.CAFile, cfg.Upstream.InsecureSkipVerify, ""); err != nil {
+		return nil, err
+	}
+	for _, h := range cfg.Upstream.HostList() {
+		if h.TLS == nil && h.CAFile == "" && h.InsecureSkipVerify == nil && h.ServerName == "" {
+			continue
+		}
+		on, ca, skip := cfg.Upstream.TLS, cfg.Upstream.CAFile, cfg.Upstream.InsecureSkipVerify
+		if h.TLS != nil {
+			on = *h.TLS
+		}
+		if h.CAFile != "" {
+			ca = h.CAFile
+		}
+		if h.InsecureSkipVerify != nil {
+			skip = *h.InsecureSkipVerify
+		}
+		tc, err := build(on, ca, skip, h.ServerName)
+		if err != nil {
+			return nil, err
+		}
+		d.hosts[d.mapHost(h.Addr)] = &hostTLS{cfg: tc}
+	}
+	d.topo = newTopology(d)
+	d.started.Store(true)
+	d.topo.start()
+	go d.reaper()
 	return d, nil
 }
 
-// Dial opens and authenticates a connection.
-func (d *Dialer) Dial(ctx context.Context) (*Conn, error) {
-	nc, err := d.dial.DialContext(ctx, "tcp", d.cfg.Addr)
+func (d *Dialer) reaper() {
+	idle, life := d.cfg.PoolIdle(), d.cfg.PoolLifetime()
+	every := idle / 4
+	if every < 100*time.Millisecond {
+		every = 100 * time.Millisecond
+	}
+	if every > 10*time.Second {
+		every = 10 * time.Second
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-d.stopReap:
+			return
+		case <-t.C:
+			for _, m := range d.topo.snapshot() {
+				m.pool.reap(idle, life)
+			}
+		}
+	}
+}
+
+// Close stops monitoring and closes pooled connections. Connections checked
+// out by clients are closed by their owners.
+func (d *Dialer) Close() {
+	d.closeOnce.Do(func() {
+		close(d.stopReap)
+		d.topo.close()
+		for _, m := range d.topo.snapshot() {
+			m.pool.close()
+		}
+	})
+}
+
+// dialAddr opens a connection to addr, authenticating when asked to.
+func (d *Dialer) dialAddr(ctx context.Context, addr string, auth bool) (*Conn, error) {
+	nc, err := d.dial.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	if d.tls != nil {
-		tc := d.tls.Clone()
+	tc := d.tls
+	if h, ok := d.hosts[addr]; ok {
+		tc = h.cfg
+	}
+	if tc != nil {
+		tc = tc.Clone()
 		if tc.ServerName == "" {
-			host, _, _ := net.SplitHostPort(d.cfg.Addr)
+			host, _, _ := net.SplitHostPort(addr)
 			tc.ServerName = host
 		}
 		tconn := tls.Client(nc, tc)
@@ -84,14 +215,143 @@ func (d *Dialer) Dial(ctx context.Context) (*Conn, error) {
 		}
 		nc = tconn
 	}
-	c := &Conn{Conn: nc, R: bufio.NewReaderSize(nc, 64*1024)}
-	if d.cfg.Username != "" {
+	now := time.Now()
+	c := &Conn{Conn: nc, R: bufio.NewReaderSize(nc, 64*1024), Addr: addr, d: d, born: now, lastUsed: now}
+	d.open.Add(1)
+	if auth && d.cfg.Username != "" {
 		if err := d.authenticate(c); err != nil {
-			nc.Close()
+			c.Close()
 			return nil, fmt.Errorf("upstream authentication: %w", err)
 		}
 	}
 	return c, nil
+}
+
+// Select picks the member a command with this selector should run on,
+// waiting for the topology to settle (for example during an election).
+func (d *Dialer) Select(ctx context.Context, sel Selector) (string, error) {
+	m, err := d.topo.selectMember(ctx, sel)
+	if err != nil {
+		return "", err
+	}
+	return m.addr, nil
+}
+
+// Dial opens an unpooled authenticated connection to the primary (or the
+// only member). The caller closes it.
+func (d *Dialer) Dial(ctx context.Context) (*Conn, error) {
+	addr, err := d.Select(ctx, Selector{Mode: Primary})
+	if err != nil {
+		return nil, err
+	}
+	return d.DialMember(ctx, addr)
+}
+
+// DialMember opens an unpooled authenticated connection to addr.
+func (d *Dialer) DialMember(ctx context.Context, addr string) (*Conn, error) {
+	c, err := d.dialAddr(ctx, addr, true)
+	if err != nil {
+		d.NetworkError(addr, err)
+	}
+	return c, err
+}
+
+// Checkout borrows a pooled connection to addr. Return it with Release, or
+// with Discard if it may be in an unknown protocol state.
+func (d *Dialer) Checkout(ctx context.Context, addr string) (*Conn, error) {
+	d.topo.mu.Lock()
+	m := d.topo.members[addr]
+	d.topo.mu.Unlock()
+	if m == nil {
+		return nil, errNoMember
+	}
+	c, err := m.pool.get(ctx)
+	if err != nil {
+		if !errors.Is(err, ErrPoolTimeout) && !errors.Is(err, context.Canceled) {
+			d.NetworkError(addr, err)
+		}
+		return nil, err
+	}
+	m.inflight.Add(1)
+	return c, nil
+}
+
+// Release returns a connection obtained from Checkout.
+func (d *Dialer) Release(c *Conn) {
+	if c == nil || c.pool == nil {
+		return
+	}
+	c.pool.m.inflight.Add(-1)
+	c.pool.put(c)
+}
+
+// Discard closes a connection obtained from Checkout (or DialMember).
+func (d *Dialer) Discard(c *Conn) {
+	if c == nil {
+		return
+	}
+	if c.pool == nil {
+		c.Close()
+		return
+	}
+	c.pool.m.inflight.Add(-1)
+	c.pool.discard(c)
+}
+
+// NetworkError tells the topology that talking to addr failed at the
+// transport level: the member becomes Unknown, its pool is flushed and the
+// monitors re-check immediately.
+func (d *Dialer) NetworkError(addr string, err error) {
+	d.topo.markUnknown(addr, true, err)
+}
+
+// StateChange tells the topology that addr answered with a "not primary" /
+// "shutting down" style error code.
+func (d *Dialer) StateChange(addr string, code int32) {
+	d.topo.markUnknown(addr, IsShutdown(code), fmt.Errorf("server error %d", code))
+}
+
+// Direct reports whether the proxy talks to one fixed member (no routing).
+func (d *Dialer) Direct() bool { return d.topo.direct }
+
+// Pooled reports whether connections are shared between clients.
+func (d *Dialer) Pooled() bool { return d.cfg.Pooled() }
+
+// MemberStats describes one member for diagnostics and tests.
+type MemberStats struct {
+	Addr        string
+	Type        string
+	InUse, Idle int
+	RTT         time.Duration
+	Err         string
+}
+
+// Stats is a snapshot of the upstream side.
+type Stats struct {
+	Members []MemberStats
+	// OpenConns counts every live upstream socket (monitors, pools, dedicated).
+	OpenConns int64
+	// PoolConnsOpened counts pooled connections ever dialed.
+	PoolConnsOpened int64
+	// TopologyEvents counts observed member state changes.
+	TopologyEvents int64
+}
+
+// Stats returns a snapshot.
+func (d *Dialer) Stats() Stats {
+	st := Stats{OpenConns: d.open.Load(), PoolConnsOpened: d.pooledOpened.Load(), TopologyEvents: d.events.Load()}
+	for _, m := range d.topo.snapshot() {
+		d.topo.mu.Lock()
+		desc := m.desc
+		d.topo.mu.Unlock()
+		in, idle := m.pool.counts()
+		ms := MemberStats{Addr: m.addr, Type: desc.Type.String(), InUse: in, Idle: idle, RTT: desc.RTT}
+		if desc.Err != nil {
+			ms.Err = desc.Err.Error()
+		}
+		st.Members = append(st.Members, ms)
+	}
+	return st
 }
 
 // RunCommand sends a command and returns the reply document.
@@ -125,15 +385,16 @@ func appendDB(cmd bsoncore.Document, db string) bsoncore.Document {
 	return out
 }
 
-// Hello returns the upstream's hello reply, used to learn wire versions.
+// Hello waits for a member to answer and returns its hello reply, used to
+// learn wire versions and limits. The primary is preferred.
 func (d *Dialer) Hello(ctx context.Context) (bsoncore.Document, error) {
-	c, err := d.Dial(ctx)
+	m, err := d.topo.selectMember(ctx, Selector{Mode: PrimaryPreferred})
 	if err != nil {
 		return nil, err
 	}
-	defer c.Close()
-	cmd := bsoncore.BuildDocument(nil, bsoncore.AppendInt32Element(nil, "hello", 1))
-	return d.RunCommand(c, "admin", cmd)
+	d.topo.mu.Lock()
+	defer d.topo.mu.Unlock()
+	return m.desc.Hello, nil
 }
 
 func (d *Dialer) authenticate(c *Conn) error {

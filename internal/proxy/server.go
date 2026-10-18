@@ -79,8 +79,10 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	d.SetLogger(log)
 	h, err := d.Hello(ctx)
 	if err != nil {
+		d.Close()
 		return nil, fmt.Errorf("probing upstream %s: %w", cfg.Upstream.Addr, err)
 	}
 	get := func(k string, def int32) int32 {
@@ -97,7 +99,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		maxWire:        get("maxWireVersion", 17),
 		sessionTimeout: get("logicalSessionTimeoutMinutes", 30),
 	}
-	log.Info("upstream reachable", "addr", cfg.Upstream.Addr, "maxWireVersion", s.limits.maxWire)
+	log.Info("upstream reachable", "hosts", len(cfg.Upstream.HostList()), "pooled", d.Pooled(), "maxWireVersion", s.limits.maxWire)
 	return s, nil
 }
 
@@ -142,7 +144,11 @@ func (s *Server) shutdown() {
 	}
 	s.mu.Unlock()
 	s.wg.Wait()
+	s.dial.Close()
 }
+
+// UpstreamStats reports the state of the upstream topology and pools.
+func (s *Server) UpstreamStats() upstream.Stats { return s.dial.Stats() }
 
 // acquireTenant enforces the per-tenant connection cap.
 func (s *Server) acquireTenant(id string) bool {
