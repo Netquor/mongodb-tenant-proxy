@@ -113,6 +113,13 @@ func NoLeak(t testing.TB, slack int) func() {
 			pprof.Lookup("goroutine").WriteTo(&sb, 1)
 			t.Errorf("goroutine leak: %d before, %d after (slack %d)\n%s", g0, g, slack, sb.String())
 		}
+		// Slack hides small leaks; our own code must not leave anything running
+		// at all (hub streams, monitors, reapers, per-connection goroutines).
+		if left := Settle(10*time.Second, 0, ownGoroutines); left > 0 {
+			var sb strings.Builder
+			pprof.Lookup("goroutine").WriteTo(&sb, 2)
+			t.Errorf("%d goroutine(s) of this module still running after shutdown:\n%s", left, ownStacks(sb.String()))
+		}
 		if f0 >= 0 {
 			f := Settle(5*time.Second, f0+slack, OpenFDs)
 			if f > f0+slack {
@@ -135,4 +142,43 @@ func RunMain(m *testing.M) {
 		}
 	}
 	os.Exit(code)
+}
+
+var dumped sync.Once
+
+// DumpOnce writes every goroutine's stack to stderr, at most once per
+// process. Call it when a scenario observes a stall so the failure carries
+// the evidence of where everything was blocked.
+func DumpOnce(why string) {
+	dumped.Do(func() {
+		var sb strings.Builder
+		pprof.Lookup("goroutine").WriteTo(&sb, 2)
+		fmt.Fprintf(os.Stderr, "=== goroutine dump: %s ===\n%s\n", why, sb.String())
+	})
+}
+
+// ownStacks keeps the goroutine stacks that have a frame in this module's
+// internal packages (other than this helper and test code).
+func ownStacks(dump string) string {
+	var out []string
+	for _, g := range strings.Split(dump, "\n\n") {
+		if !strings.Contains(g, "mongodb-tenant-proxy/internal/") {
+			continue
+		}
+		if strings.Contains(g, "internal/stresstest.") || strings.Contains(g, "testing.tRunner") || strings.Contains(g, "testing.(*T).Run") {
+			continue
+		}
+		out = append(out, g)
+	}
+	return strings.Join(out, "\n\n")
+}
+
+func ownGoroutines() int {
+	var sb strings.Builder
+	pprof.Lookup("goroutine").WriteTo(&sb, 2)
+	s := ownStacks(sb.String())
+	if s == "" {
+		return 0
+	}
+	return strings.Count(s, "\n\n") + 1
 }

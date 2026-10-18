@@ -166,6 +166,9 @@ func (s *Server) shutdown() {
 	}
 	s.mu.Unlock()
 	s.wg.Wait()
+	if s.fan != nil {
+		s.fan.Close() // before the dialer: stops hub streams and their reconnect loops
+	}
 	s.dial.Close()
 	s.audit.Close()
 	s.reg.Close()

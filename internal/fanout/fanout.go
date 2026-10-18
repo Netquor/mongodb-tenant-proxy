@@ -32,6 +32,9 @@ const (
 // private, server-filtered stream from its last token.
 var ErrOverflow = errors.New("change stream subscriber too slow")
 
+// errClosed is returned to subscribers of a hub that was shut down.
+var errClosed = errors.New("change stream fan-out closed")
+
 // Timestamp is a BSON timestamp.
 type Timestamp struct{ T, I uint32 }
 
@@ -59,8 +62,9 @@ type Manager struct {
 	// No path takes them in any other order: Subscribe releases Manager.mu
 	// before hub.add; Sub methods release Sub.mu before calling into the hub;
 	// hub.run releases hub.mu before taking Manager.mu.
-	mu   sync.Mutex
-	hubs map[string]*hub
+	mu     sync.Mutex
+	hubs   map[string]*hub
+	closed bool
 }
 
 // NewManager creates a Manager.
@@ -75,6 +79,29 @@ func (m *Manager) ActiveHubs() int {
 	return len(m.hubs)
 }
 
+// Close shuts every hub down: upstream streams are cancelled, their goroutines
+// exit and subscribers fail. Without it a hub (and its upstream connection)
+// outlives the server until its idle grace period ends - never, if it still
+// has subscribers or is retrying a broken stream.
+func (m *Manager) Close() {
+	m.mu.Lock()
+	m.closed = true
+	hubs := m.hubs
+	m.hubs = map[string]*hub{}
+	m.mu.Unlock()
+	for _, h := range hubs {
+		h.mu.Lock()
+		h.closed = true
+		if h.idle != nil {
+			h.idle.Stop()
+			h.idle = nil
+		}
+		h.mu.Unlock()
+		h.cancel()
+		h.failAll(errClosed)
+	}
+}
+
 // TenantKey is the routing key for a tenant value.
 func TenantKey(t bsoncore.Type, data []byte) string { return string([]byte{byte(t)}) + string(data) }
 
@@ -87,7 +114,13 @@ func (m *Manager) Subscribe(db, coll, tenantKey string, o Options) *Sub {
 		h := m.hubs[db+"."+coll]
 		if h == nil {
 			h = newHub(m, db, coll)
-			m.hubs[db+"."+coll] = h
+			if m.closed {
+				// Shutting down: hand out a subscriber whose Start fails
+				// instead of starting an upstream stream nobody will stop.
+				h.cancel()
+			} else {
+				m.hubs[db+"."+coll] = h
+			}
 		}
 		m.mu.Unlock()
 		if s := h.add(tenantKey, o); s != nil {
@@ -194,16 +227,21 @@ func (h *hub) shutdownIfIdle() {
 // start launches the upstream stream (once), beginning at `at`, and waits
 // until it is open.
 func (h *hub) start(at Timestamp) error {
+	if h.ctx.Err() != nil {
+		return errClosed
+	}
 	h.mu.Lock()
 	if !h.started {
 		h.started = true
 		go h.run(at)
 	}
 	h.mu.Unlock()
+	timeout := time.NewTimer(20 * time.Second)
+	defer timeout.Stop()
 	select {
 	case <-h.ready:
 		return h.openErr
-	case <-time.After(20 * time.Second):
+	case <-timeout.C:
 		return errors.New("timed out opening change stream")
 	}
 }
@@ -232,6 +270,9 @@ func (h *hub) run(first Timestamp) {
 			close(h.ready)
 		}
 	}
+	// However run ends, a subscriber still waiting for the first open must
+	// not sit out the 20s timeout.
+	defer signalReady(errClosed)
 	for h.ctx.Err() == nil {
 		err := h.stream(first, &token, signalReady)
 		if h.ctx.Err() != nil {

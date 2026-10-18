@@ -269,3 +269,32 @@ func TestStressFailAllVsDispatch(t *testing.T) {
 	}
 	_ = bytes.MinRead
 }
+
+// Manager.Close ends every hub, wakes waiters with an error, and later
+// subscribers fail fast instead of starting a stream nobody would stop.
+func TestManagerClose(t *testing.T) {
+	defer stresstest.Watchdog(t, time.Minute)()
+	m := newTestManager(time.Hour)
+	var subs []*Sub
+	for i := 0; i < 10; i++ {
+		subs = append(subs, m.Subscribe("d", fmt.Sprint("c", i%3), tkey("a"), Options{}))
+	}
+	errc := make(chan error, 1)
+	go func() { _, _, _, err := subs[0].Next(1, time.Minute); errc <- err }()
+	time.Sleep(20 * time.Millisecond)
+	m.Close()
+	if err := <-errc; !errors.Is(err, errClosed) {
+		t.Fatalf("waiter got %v, want errClosed", err)
+	}
+	if n := m.ActiveHubs(); n != 0 {
+		t.Fatalf("%d hubs after Close", n)
+	}
+	late := m.Subscribe("d", "c0", tkey("a"), Options{})
+	if _, err := late.Start(Timestamp{}); !errors.Is(err, errClosed) {
+		t.Fatalf("late Start: %v", err)
+	}
+	for _, s := range subs {
+		s.Close()
+	}
+	m.Close() // idempotent
+}
