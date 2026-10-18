@@ -42,7 +42,7 @@ func count(t *testing.T, c *mongo.Collection, filter any) int64 {
 }
 
 func TestTenantIsolation(t *testing.T) {
-	e := setup(t, nil)
+	e := setup(t, func(c *config.Config) { c.DisableJS = true })
 	a, b := e.tenant(t, "tenant-a"), e.tenant(t, "tenant-b")
 	ca, cb := a.Database("app").Collection("items"), b.Database("app").Collection("items")
 	raw := e.direct.Database("app").Collection("items")
@@ -371,8 +371,6 @@ func TestAggregationIsolation(t *testing.T) {
 
 	t.Run("dangerous stages are refused", func(t *testing.T) {
 		for _, st := range []bson.D{
-			{{Key: "$out", Value: "stolen"}},
-			{{Key: "$merge", Value: bson.M{"into": "stolen"}}},
 			{{Key: "$currentOp", Value: bson.M{}}},
 			{{Key: "$collStats", Value: bson.M{"count": bson.M{}}}},
 			{{Key: "$indexStats", Value: bson.M{}}},

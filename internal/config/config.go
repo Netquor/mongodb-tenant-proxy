@@ -24,8 +24,13 @@ type Config struct {
 	Databases []string `json:"databases,omitempty"`
 	// DenyCommands disables individual supported commands.
 	DenyCommands []string `json:"denyCommands,omitempty"`
-	// AllowJS permits $where/$function/$accumulator.
-	AllowJS bool `json:"allowJS,omitempty"`
+	// DisableJS rejects server-side JavaScript ($where, $function,
+	// $accumulator, mapReduce). It is allowed by default: JavaScript runs
+	// inside mongod without access to other documents or collections, and
+	// the tenant filter is applied around it.
+	DisableJS bool `json:"disableJS,omitempty"`
+	// DisableViews turns off tenant-scoped views.
+	DisableViews bool `json:"disableViews,omitempty"`
 	// ChangeStreams controls collection-level change streams.
 	ChangeStreams ChangeStreams `json:"changeStreams,omitempty"`
 

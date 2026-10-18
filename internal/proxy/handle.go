@@ -39,7 +39,14 @@ func (c *conn) handleMsg(h wire.Header, body []byte) error {
 		return c.reply(h, errorDoc(13, "Unauthorized", "tenant proxy: authentication required"))
 	}
 
+	if handled, err := c.maybeView(h, m, name, db); handled || err != nil {
+		return err
+	}
+
 	res, err := c.s.rw.Rewrite(c.tenant, db, m.Body, m.Seqs)
+	if err == nil && name == "listCollections" {
+		c.hookListCollections(res, m.Body, db)
+	}
 	if err != nil {
 		c.s.M.Command(name, "denied")
 		c.log.Warn("command denied", "db", db, "command", name, "reason", err.Error())
@@ -81,11 +88,33 @@ func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMore
 		c.s.M.Command(res.Command, "error")
 		return c.reply(h, errorDoc(6, "HostUnreachable", "tenant proxy: upstream unavailable"))
 	}
+	if !c.s.cfg.ChangeStreams.DisableAutoImages && c.s.dbWatched(res.DB) {
+		// A database-level stream is open: collections created from now on
+		// need pre/post images before their first write.
+		if coll := writeTarget(res); coll != "" {
+			if err := c.s.dial.EnsureImages(c.up, res.DB, coll); err != nil {
+				c.log.Warn("enabling change stream images failed", "coll", coll, "err", err)
+			}
+		}
+	}
+	if res.ChangeStream && res.DBLevel {
+		c.s.dbStreams.Store(res.DB, struct{}{})
+	}
 	if res.ChangeStream && !c.s.cfg.ChangeStreams.DisableAutoImages {
-		if err := c.s.dial.EnsureImages(c.up, res.DB, res.Collection); err != nil {
+		var err error
+		if res.DBLevel {
+			err = c.s.dial.EnsureImagesDB(c.up, res.DB)
+		} else {
+			err = c.s.dial.EnsureImages(c.up, res.DB, res.Collection)
+		}
+		if err != nil {
 			c.log.Error("enabling change stream images failed", "err", err)
 			return c.reply(h, errorDoc(8, "UnknownError", "tenant proxy: could not enable change stream images: "+err.Error()))
 		}
+	}
+	if bad := c.runSteps(res.Before); bad != nil {
+		c.s.M.Command(res.Command, "error")
+		return c.reply(h, bad)
 	}
 	out := wire.Msg{
 		Flags: flags &^ (wire.FlagExhaustAllowed | wire.FlagChecksumPresent),
@@ -106,15 +135,28 @@ func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMore
 	if rh.OpCode != wire.OpMsg {
 		return errors.New("unexpected upstream opcode")
 	}
-	needParse := res.Post != nil || tracksCursor(res.Command)
+	needParse := res.Post != nil || res.Alias != "" || len(res.After) > 0 || tracksCursor(res.Command)
 	if needParse {
 		rm, err := wire.ParseMsg(rb)
 		if err != nil {
 			return err
 		}
+		if len(res.After) > 0 {
+			if ok, _ := rm.Body.Lookup("ok").AsInt64OK(); ok == 1 {
+				if bad := c.runSteps(res.After); bad != nil {
+					c.s.M.Command(res.Command, "error")
+					return c.reply(h, bad)
+				}
+			}
+		}
 		if res.Post != nil {
 			rm.Body = res.Post(rm.Body)
 			rb = rm.Encode()
+		}
+		if res.Alias != "" {
+			rm.Body = patchCursorNS(rm.Body, res.DB+"."+res.Alias)
+			rb = rm.Encode()
+			c.noteViewCursor(rm.Body, res.Phys, getMoreID)
 		}
 		c.trackCursor(res.Command, getMoreID, rm.Body)
 	}
@@ -148,6 +190,7 @@ func (c *conn) trackCursor(cmd string, getMoreID int64, resp bsoncore.Document) 
 	switch {
 	case id == 0 && cmd == "getMore":
 		delete(c.cursors, getMoreID)
+		delete(c.viewPhys, getMoreID)
 	case id != 0 && cmd != "getMore":
 		if len(c.cursors) < maxCursorsPerConn {
 			ns, _ := cur.Lookup("ns").StringValueOK()
@@ -167,7 +210,11 @@ func (c *conn) handleGetMore(h wire.Header, m *wire.Msg, db string) error {
 		c.s.M.Command("getMore", "denied")
 		return c.reply(h, errorDoc(43, "CursorNotFound", fmt.Sprintf("cursor id %d not found", id)))
 	}
-	return c.forward(h, m.Flags, &rewrite.Result{Command: "getMore", DB: db, Body: m.Body}, id)
+	res := &rewrite.Result{Command: "getMore", DB: db, Body: m.Body}
+	if phys, isView := c.viewPhys[id]; isView {
+		res.Body, res.Alias, res.Phys = withString(m.Body, "collection", phys), coll, phys
+	}
+	return c.forward(h, m.Flags, res, id)
 }
 
 func (c *conn) handleKillCursors(h wire.Header, m *wire.Msg, db string) error {
@@ -222,6 +269,12 @@ func (c *conn) handleKillCursors(h wire.Header, m *wire.Msg, db string) error {
 	nb[0], nb[1], nb[2], nb[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
 	for _, id := range ownedIDs {
 		delete(c.cursors, id)
+	}
+	for _, id := range ownedIDs {
+		if phys, isView := c.viewPhys[id]; isView {
+			nb = withString(nb, "killCursors", phys)
+			delete(c.viewPhys, id)
+		}
 	}
 	return c.forward(h, m.Flags, &rewrite.Result{Command: "killCursors", DB: db, Body: nb}, 0)
 }
@@ -354,4 +407,49 @@ func (c *conn) handleSASL(name string, cmd bsoncore.Document) bsoncore.Document 
 		bsoncore.AppendBinaryElement(nil, "payload", 0, out),
 		bsoncore.AppendInt32Element(nil, "ok", 1),
 	)
+}
+
+// runSteps executes housekeeping commands on the upstream connection. It
+// returns an error document for the client if one fails.
+func (c *conn) runSteps(cmds []rewrite.Command) bsoncore.Document {
+steps:
+	for _, cmd := range cmds {
+		if cmd.CacheKey != "" {
+			if _, done := c.s.steps.Load(cmd.CacheKey); done {
+				continue
+			}
+		}
+		resp, err := c.s.dial.RunCommand(c.up, cmd.DB, cmd.Body)
+		if err != nil {
+			return errorDoc(6, "HostUnreachable", "tenant proxy: "+err.Error())
+		}
+		if ok, _ := resp.Lookup("ok").AsInt64OK(); ok != 1 {
+			code, _ := resp.Lookup("code").AsInt64OK()
+			for _, ig := range cmd.IgnoreCodes {
+				if int64(ig) == code {
+					if cmd.CacheKey != "" {
+						c.s.steps.Store(cmd.CacheKey, struct{}{})
+					}
+					continue steps
+				}
+			}
+			return resp
+		}
+		if cmd.CacheKey != "" {
+			c.s.steps.Store(cmd.CacheKey, struct{}{})
+		}
+	}
+	return nil
+}
+
+// writeTarget returns the collection a write-type command targets ("" otherwise).
+func writeTarget(res *rewrite.Result) string {
+	switch res.Command {
+	case "insert", "update", "delete", "findAndModify", "createIndexes", "create":
+		if e, err := res.Body.IndexErr(0); err == nil {
+			c, _ := e.Value().StringValueOK()
+			return c
+		}
+	}
+	return ""
 }

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -225,5 +226,30 @@ func (d *Dialer) EnsureImages(c *Conn, db, coll string) error {
 		}
 	}
 	d.images.Store(db+"."+coll, struct{}{})
+	return nil
+}
+
+// EnsureImagesDB enables pre/post images on every existing collection of db.
+func (d *Dialer) EnsureImagesDB(c *Conn, db string) error {
+	resp, err := d.RunCommand(c, db, bsoncore.BuildDocument(nil,
+		bsoncore.AppendInt32Element(nil, "listCollections", 1),
+		bsoncore.AppendBooleanElement(nil, "nameOnly", true),
+		bsoncore.AppendDocumentElement(nil, "filter", bsoncore.BuildDocument(nil, bsoncore.AppendStringElement(nil, "type", "collection"))),
+		bsoncore.AppendDocumentElement(nil, "cursor", bsoncore.BuildDocument(nil, bsoncore.AppendInt32Element(nil, "batchSize", 100000)))))
+	if err != nil {
+		return err
+	}
+	batch, _ := resp.Lookup("cursor", "firstBatch").ArrayOK()
+	vals, _ := batch.Values()
+	for _, v := range vals {
+		doc, _ := v.DocumentOK()
+		name, _ := doc.Lookup("name").StringValueOK()
+		if name == "" || strings.HasPrefix(name, "system.") || strings.HasPrefix(name, "__mtp_") {
+			continue
+		}
+		if err := d.EnsureImages(c, db, name); err != nil {
+			return err
+		}
+	}
 	return nil
 }

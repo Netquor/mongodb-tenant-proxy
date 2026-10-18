@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -105,6 +106,21 @@ type hub struct {
 	ready   chan struct{} // closed after the first successful open
 	openErr error
 	token   atomic.Value // bsoncore.Document: latest position
+}
+
+func (h *hub) collName() string {
+	if h.coll == "" {
+		return "$cmd.aggregate"
+	}
+	return h.coll
+}
+
+// DBWatched reports whether a database-level hub exists for db.
+func (m *Manager) DBWatched(db string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.hubs[db+"."]
+	return ok
 }
 
 func newHub(m *Manager, db, coll string) *hub {
@@ -261,23 +277,39 @@ func (h *hub) stream(first Timestamp, token *bsoncore.Document, ready func(error
 	defer c.Close()
 	go func() { <-h.ctx.Done(); c.Close() }()
 
+	mode := "required"
+	if h.coll == "" {
+		mode = "whenAvailable" // database-level: some collections may lack images
+	}
 	if m.AutoImages {
-		if err := m.Dial.EnsureImages(c, h.db, h.coll); err != nil {
+		var err error
+		if h.coll == "" {
+			err = m.Dial.EnsureImagesDB(c, h.db)
+		} else {
+			err = m.Dial.EnsureImages(c, h.db, h.coll)
+		}
+		if err != nil {
 			return fmt.Errorf("enabling pre/post images: %w", err)
 		}
 	}
 
 	cs := bsoncore.BuildDocument(nil,
-		bsoncore.AppendStringElement(nil, "fullDocument", "required"),
-		bsoncore.AppendStringElement(nil, "fullDocumentBeforeChange", "required"))
+		bsoncore.AppendStringElement(nil, "fullDocument", mode),
+		bsoncore.AppendStringElement(nil, "fullDocumentBeforeChange", mode))
 	switch {
 	case len(*token) > 0:
 		cs = appendElem(cs, bsoncore.AppendDocumentElement(nil, "startAfter", *token))
 	case first.T != 0:
 		cs = appendElem(cs, bsoncore.AppendTimestampElement(nil, "startAtOperationTime", first.T, first.I))
 	}
+	var target []byte
+	if h.coll == "" {
+		target = bsoncore.AppendInt32Element(nil, "aggregate", 1)
+	} else {
+		target = bsoncore.AppendStringElement(nil, "aggregate", h.coll)
+	}
 	cmd := bsoncore.BuildDocument(nil,
-		bsoncore.AppendStringElement(nil, "aggregate", h.coll),
+		target,
 		bsoncore.AppendArrayElement(nil, "pipeline", bsoncore.BuildArray(nil,
 			bsoncore.Value{Type: bsoncore.TypeEmbeddedDocument, Data: bsoncore.BuildDocument(nil,
 				bsoncore.AppendDocumentElement(nil, "$changeStream", cs))})),
@@ -311,7 +343,7 @@ func (h *hub) stream(first Timestamp, token *bsoncore.Document, ready func(error
 		}
 		next := bsoncore.BuildDocument(nil,
 			bsoncore.AppendInt64Element(nil, "getMore", id),
-			bsoncore.AppendStringElement(nil, "collection", h.coll),
+			bsoncore.AppendStringElement(nil, "collection", h.collName()),
 			bsoncore.AppendInt32Element(nil, "batchSize", upstreamBatch),
 			bsoncore.AppendInt32Element(nil, "maxTimeMS", 1000),
 		)
@@ -343,6 +375,11 @@ func (h *hub) dispatch(batch bsoncore.Array, pbrt bsoncore.Document, token *bson
 		}
 		if id, ok := ev.Lookup("_id").DocumentOK(); ok {
 			*token = id
+		}
+		if h.coll == "" {
+			if c, _ := ev.Lookup("ns", "coll").StringValueOK(); strings.HasPrefix(c, "__mtp_") {
+				continue // proxy bookkeeping, never shown to tenants
+			}
 		}
 		if op, _ := ev.Lookup("operationType").StringValueOK(); lifecycle(op) {
 			// Collection/database lifecycle events carry no document data, so

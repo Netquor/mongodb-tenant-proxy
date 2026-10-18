@@ -37,6 +37,11 @@ type Server struct {
 	tenant map[string]int
 	wg     sync.WaitGroup
 	fan    *fanout.Manager
+	views  viewCache
+	// dbStreams records databases that have been watched at database level;
+	// writes to their collections get pre/post images enabled first.
+	dbStreams sync.Map
+	steps     sync.Map // CacheKey -> struct{}: housekeeping commands already applied
 }
 
 type helloLimits struct {
@@ -65,7 +70,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 			Field:         cfg.Tenant.Field,
 			Databases:     cfg.Databases,
 			DenyCommands:  cfg.DenyCommands,
-			AllowJS:       cfg.AllowJS,
+			AllowJS:       !cfg.DisableJS,
 			ChangeStreams: !cfg.ChangeStreams.Disabled,
 		}),
 	}
@@ -157,3 +162,5 @@ func (s *Server) releaseTenant(id string) {
 	}
 	s.mu.Unlock()
 }
+
+func (s *Server) dbWatched(db string) bool { _, ok := s.dbStreams.Load(db); return ok }

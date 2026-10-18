@@ -103,15 +103,7 @@ func TestChangeStreams(t *testing.T) {
 		t.Fatalf("unexpected extra event on A's stream: %+v", ev)
 	}
 
-	// Db-level and cluster-level streams are refused.
-	if cs, err := a.Database("cs").Watch(ctx(t), mongo.Pipeline{}); err == nil {
-		ok := cs.TryNext(ctx(t))
-		err = cs.Err()
-		cs.Close(context.Background())
-		if ok || err == nil {
-			t.Fatal("database-level change stream was allowed")
-		}
-	}
+	// Cluster-level streams are refused.
 	if cs, err := a.Watch(ctx(t), mongo.Pipeline{}); err == nil {
 		ok := cs.TryNext(ctx(t))
 		err = cs.Err()
@@ -269,5 +261,82 @@ func TestChangeStreamLifecycleEvents(t *testing.T) {
 	defer cancel()
 	if cs.Next(c) {
 		t.Fatal("stream should be closed after invalidate")
+	}
+}
+
+func TestDatabaseChangeStreams(t *testing.T) {
+	for _, fanout := range []bool{true, false} {
+		name := "fanout"
+		if !fanout {
+			name = "private"
+		}
+		t.Run(name, func(t *testing.T) {
+			e := setup(t, func(c *config.Config) { c.ChangeStreams.DisableFanout = !fanout })
+			a, b := e.tenant(t, "tenant-a"), e.tenant(t, "tenant-b")
+			da, db := a.Database("dbs"), b.Database("dbs")
+			// One collection exists before the watch...
+			_, err := da.Collection("old").InsertOne(ctx(t), bson.M{"_id": "seed"})
+			must(t, err)
+			wa, err := da.Watch(ctx(t), mongo.Pipeline{})
+			must(t, err)
+			defer wa.Close(context.Background())
+			wb, err := db.Watch(ctx(t), mongo.Pipeline{})
+			must(t, err)
+			defer wb.Close(context.Background())
+
+			// ...and another is created after it, by both tenants.
+			_, err = da.Collection("new").InsertOne(ctx(t), bson.M{"_id": "a-new"})
+			must(t, err)
+			_, err = db.Collection("new").InsertOne(ctx(t), bson.M{"_id": "b-new"})
+			must(t, err)
+			_, err = da.Collection("old").UpdateOne(ctx(t), bson.M{"_id": "seed"}, bson.M{"$set": bson.M{"v": 1}})
+			must(t, err)
+			_, err = da.Collection("new").DeleteOne(ctx(t), bson.M{"_id": "a-new"})
+			must(t, err)
+			_, err = db.Collection("new").UpdateOne(ctx(t), bson.M{"_id": "b-new"}, bson.M{"$set": bson.M{"v": 2}})
+			must(t, err)
+			// Bookkeeping must stay invisible: creating a view writes to the registry.
+			must(t, da.CreateView(ctx(t), "aview", "old", mongo.Pipeline{}))
+
+			type nsEvent struct {
+				Op string `bson:"operationType"`
+				NS struct {
+					Coll string `bson:"coll"`
+				} `bson:"ns"`
+				Key bson.M `bson:"documentKey"`
+			}
+			read := func(cs *mongo.ChangeStream, n int) []nsEvent {
+				c, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				var out []nsEvent
+				for len(out) < n && cs.Next(c) {
+					var ev nsEvent
+					must(t, cs.Decode(&ev))
+					out = append(out, ev)
+				}
+				if len(out) < n {
+					t.Fatalf("got %d events, want %d (err=%v)", len(out), n, cs.Err())
+				}
+				return out
+			}
+			got := read(wa, 3)
+			want := []struct{ op, coll string }{{"insert", "new"}, {"update", "old"}, {"delete", "new"}}
+			for i, w := range want {
+				if got[i].Op != w.op || got[i].NS.Coll != w.coll || got[i].Key["_id"] == "b-new" {
+					t.Fatalf("A event %d = %+v, want %v", i, got[i], w)
+				}
+			}
+			gb := read(wb, 2)
+			if gb[0].Op != "insert" || gb[1].Op != "update" || gb[1].NS.Coll != "new" {
+				t.Fatalf("B events: %+v", gb)
+			}
+			c, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+			defer cancel()
+			if wa.TryNext(c) {
+				var ev nsEvent
+				wa.Decode(&ev)
+				t.Fatalf("unexpected extra event for A (internal collections leaked?): %+v", ev)
+			}
+		})
 	}
 }

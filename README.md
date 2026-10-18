@@ -22,9 +22,20 @@ app (driver) ──► mongodb-tenant-proxy ──► MongoDB (replica set / sta
 | `getMore` / `killCursors` | only cursors opened on the same connection are usable |
 | `listDatabases` | filtered to accessible databases |
 | `explain` | inner command is rewritten |
-| `$changeStream` | opt-in, collection-level only – see below |
+| `$changeStream` | collection- and database-level, on by default – see below |
+| `$merge` / `$out` | matched on `(tenantId, …)` with an auto-created unique index; documents stamped with the tenant; `$out` replaces only the tenant's documents |
+| views (`create`+`viewOn`, `collMod`, `drop`) | per-tenant hidden physical views with a tenant-scoped pipeline; see below |
+| `mapReduce` | inline output, query scoped |
 
-Everything else is **denied** by default: `$out`, `$merge`, `$currentOp`, `$collStats`, `$indexStats`, `$search`, `$documents`, `dropDatabase`, `renameCollection`, `collMod`, `mapReduce`, views, `system.*` collections, `admin`/`local`/`config`, server-side JavaScript (`$where`, `$function`, `$accumulator` unless `allowJS`), duplicate command keys, and unknown commands. Denials are returned as `Unauthorized (13)` and logged.
+Everything else is **denied** by default: `$currentOp`, `$collStats`, `$indexStats`, `$search`/`$vectorSearch` (Atlas), `$documents`, cluster-level change streams, `dropDatabase`, `renameCollection`, `collMod` on collections, `mapReduce` output to a collection, `system.*` and `__mtp_*` collections, `admin`/`local`/`config`, duplicate command keys, and unknown commands. Denials are returned as `Unauthorized (13)` and logged. Server-side JavaScript (`$where`, `$function`, `$accumulator`, `mapReduce`) is **allowed** — it runs inside `mongod` with the tenant filter wrapped around it and cannot reach other documents or collections; set `disableJS` to reject it.
+
+## Views
+
+A physical view is shared by every tenant, so it can't hold a per-tenant definition (a `$group` view would mix tenants). Each tenant view therefore becomes its own hidden physical view `__mtp_v.<hash>.<name>` whose pipeline starts with the tenant filter, and the proxy maps the tenant's name to it. Definitions live in `__mtp_views` (per database), so two tenants can have different views with the same name, `listCollections` shows only a tenant's own views (`type: "view"`), view-on-view works, and `collMod`/`drop` affect only the caller's view. Views are read-only; names can't collide with the tenant's collections. Disable with `disableViews`.
+
+## `$merge` / `$out`
+
+Output collections are shared, so writes are matched on `(tenantId, <on fields>)` using a unique index with exactly that key (created automatically). A tenant can never overwrite another tenant's document, and the stage re-stamps the tenant on every document. `$out` is emulated as "replace this tenant's documents": it merges with a run marker, then deletes the tenant's documents that weren't part of the run — so unlike a real `$out` it is **not atomic** (other tenants are unaffected). `$merge`/`$out` are allowed only as the last stage of a top-level aggregate.
 
 ## Identifying the tenant (`auth.mode`)
 
@@ -42,7 +53,7 @@ On by default (MongoDB 6.0+), collection level. Tenants get the stream a real se
 * **Private server-side stream.** Anything else (`resumeAfter`/`startAfter`/`startAtOperationTime`, `$project` and other stages, `showExpandedEvents`) runs as a normal change stream with a `$match` placed directly after `$changeStream`, so client stages never see other tenants' events.
 * **Tenant on every event.** Updates and deletes don't carry `tenantId`, so the proxy forces `fullDocument`/`fullDocumentBeforeChange: "required"` (collection pre/post images) and removes them again unless the client asked. The proxy enables `changeStreamPreAndPostImages` itself the first time a collection is watched (disable with `changeStreams.disableAutoImages`).
 * **Lifecycle events** (`drop`, `rename`, `dropDatabase`, `invalidate`) carry no document data and are delivered to every watcher of the collection, closing the stream after `invalidate`, as on a real server.
-* Database- and cluster-level streams are refused. Config: `changeStreams.{disabled, disableAutoImages, disableFanout}`.
+* **Database-level streams** (`db.watch()`) use one shared stream per database. The proxy enables images on the database's existing collections when the stream opens, and on collections written to afterwards; events from the proxy's own `__mtp_*` collections are never delivered. Cluster-level streams are refused. Config: `changeStreams.{disabled, disableAutoImages, disableFanout}`. (With several proxy instances, only the instance serving the watcher enables images for collections created later.)
 
 Cost: pre/post images add oplog/storage on watched collections.
 
@@ -67,6 +78,7 @@ See [`proxy.example.json`](proxy.example.json). Metrics (`/metrics`, Prometheus 
 * `_id` is unique per *collection*, not per tenant. Use generated ObjectIds/UUIDs; a natural `_id` reused by two tenants will collide (and reveals existence).
 * Indexes are shared physical objects: one tenant creating an index affects all; `dropIndexes: "*"` is refused. Deny `createIndexes`/`dropIndexes` via `denyCommands` if tenants must not manage indexes. TTL indexes cannot carry the tenant prefix (unique TTL indexes are refused).
 * The `tenantId` field is visible in returned documents.
+* `mapReduce` can't write to a collection (use `$merge`); `listCollections` filters other than `name`/`type` don't apply to views.
 * No wire compression (not advertised), no `SCRAM-SHA-1`/x.509 on the client side.
 * Session ids (`lsid`) are unguessable UUIDs but are not bound to a tenant.
 

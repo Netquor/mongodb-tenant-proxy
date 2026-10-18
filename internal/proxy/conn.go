@@ -33,20 +33,22 @@ type conn struct {
 	tenantHeld bool
 	sasl       *auth.SASL
 
-	up      *upstream.Conn
-	cursors map[int64]string      // cursor id -> namespace it was opened on
-	streams map[int64]*fanout.Sub // virtual change stream cursors served by the fan-out
-	outID   int32
+	up       *upstream.Conn
+	cursors  map[int64]string      // cursor id -> namespace it was opened on
+	viewPhys map[int64]string      // view cursor id -> physical view collection
+	streams  map[int64]*fanout.Sub // virtual change stream cursors served by the fan-out
+	outID    int32
 }
 
 func newConn(s *Server, nc net.Conn) *conn {
 	id := s.nextID.Add(1)
 	return &conn{
 		s: s, nc: nc, id: id,
-		br:      bufio.NewReaderSize(nc, 64*1024),
-		cursors: map[int64]string{},
-		streams: map[int64]*fanout.Sub{},
-		log:     s.log.With("conn", id, "remote", nc.RemoteAddr().String()),
+		br:       bufio.NewReaderSize(nc, 64*1024),
+		cursors:  map[int64]string{},
+		streams:  map[int64]*fanout.Sub{},
+		viewPhys: map[int64]string{},
+		log:      s.log.With("conn", id, "remote", nc.RemoteAddr().String()),
 	}
 }
 

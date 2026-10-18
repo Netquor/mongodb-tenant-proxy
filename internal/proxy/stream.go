@@ -26,6 +26,9 @@ func (c *conn) openStream(h wire.Header, m *wire.Msg, res *rewrite.Result) (hand
 		return false, nil
 	}
 	spec := res.Stream
+	if res.DBLevel {
+		c.s.dbStreams.Store(res.DB, struct{}{})
+	}
 	sub := c.s.fan.Subscribe(res.DB, res.Collection, fanout.TenantKey(c.tenant.Value.Type, c.tenant.Value.Data),
 		fanout.Options{FullDocument: spec.FullDocument, Before: spec.Before, OpTypes: spec.OpTypes})
 
@@ -46,6 +49,9 @@ func (c *conn) openStream(h wire.Header, m *wire.Msg, res *rewrite.Result) (hand
 	}
 	id := c.newCursorID()
 	ns := res.DB + "." + res.Collection
+	if res.DBLevel {
+		ns = res.DB + ".$cmd.aggregate"
+	}
 	c.cursors[id] = ns
 	c.streams[id] = sub
 	c.s.M.Command("aggregate", "ok")

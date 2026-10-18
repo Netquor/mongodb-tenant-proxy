@@ -18,7 +18,7 @@ var safeStages = map[string]struct{}{
 // collection and a tenant filter is added at the front; when false (for
 // $facet branches) the input stream is already scoped, but nested stages are
 // still rewritten.
-func (r *Rewriter) scopePipeline(t *Tenant, p arr, inject bool) (arr, error) {
+func (r *Rewriter) scopePipeline(t *Tenant, p arr, inject bool, ex *extras) (arr, error) {
 	stages, err := p.Values()
 	if err != nil {
 		return nil, badValue("malformed pipeline")
@@ -73,12 +73,22 @@ func (r *Rewriter) scopePipeline(t *Tenant, p arr, inject bool) (arr, error) {
 			if !inject || i != 0 {
 				return nil, deny("$changeStream must be the first stage of a collection aggregate")
 			}
-			cs, err := r.rewriteChangeStream(t, spec)
+			cs, err := r.rewriteChangeStream(t, spec, ex != nil && ex.dbLevel)
 			if err != nil {
 				return nil, err
 			}
 			out = append(out, cs...)
 			scopedFirst = true
+			continue
+		case "$merge", "$out":
+			if ex == nil || i != len(stages)-1 {
+				return nil, deny("%s must be the last stage of a top-level aggregate", name)
+			}
+			w, err := r.rewriteWrite(t, name, spec, ex)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, w...)
 			continue
 		case "$lookup":
 			ns, err = r.rewriteLookup(t, spec)
@@ -163,7 +173,7 @@ func (r *Rewriter) rewriteLookup(t *Tenant, spec value) (value, error) {
 			if !ok {
 				return value{}, badValue("$lookup pipeline must be an array")
 			}
-			np, err := r.scopePipeline(t, p, true)
+			np, err := r.scopePipeline(t, p, true, nil)
 			if err != nil {
 				return value{}, err
 			}
@@ -183,7 +193,7 @@ func (r *Rewriter) rewriteLookup(t *Tenant, spec value) (value, error) {
 	}
 	if !hasPipeline {
 		// MongoDB 5.0+ allows localField/foreignField together with a pipeline.
-		np, _ := r.scopePipeline(t, arrayOf(), true)
+		np, _ := r.scopePipeline(t, arrayOf(), true, nil)
 		out = bsoncore.AppendArrayElement(out, "pipeline", np)
 	}
 	return docValue(finishDoc(out)), nil
@@ -221,7 +231,7 @@ func (r *Rewriter) rewriteGraphLookup(t *Tenant, spec value) (value, error) {
 }
 
 func (r *Rewriter) rewriteUnionWith(t *Tenant, spec value) (value, error) {
-	scoped, _ := r.scopePipeline(t, arrayOf(), true)
+	scoped, _ := r.scopePipeline(t, arrayOf(), true, nil)
 	switch spec.Type {
 	case bsoncore.TypeString:
 		if err := checkCollName(spec.StringValue()); err != nil {
@@ -259,7 +269,7 @@ func (r *Rewriter) rewriteUnionWith(t *Tenant, spec value) (value, error) {
 				if !ok {
 					return value{}, badValue("$unionWith pipeline must be an array")
 				}
-				np, err := r.scopePipeline(t, p, true)
+				np, err := r.scopePipeline(t, p, true, nil)
 				if err != nil {
 					return value{}, err
 				}
@@ -295,7 +305,7 @@ func (r *Rewriter) rewriteFacet(t *Tenant, spec value) (value, error) {
 		if !ok {
 			return value{}, badValue("$facet branch %q must be an array", e.Key())
 		}
-		np, err := r.scopePipeline(t, p, false)
+		np, err := r.scopePipeline(t, p, false, nil)
 		if err != nil {
 			return value{}, err
 		}
@@ -312,7 +322,7 @@ func (r *Rewriter) rewriteFacet(t *Tenant, spec value) (value, error) {
 //  3. stages that reshape events back to what the client asked for.
 //
 // Events without a tenant image (drop, rename, invalidate, ...) are dropped.
-func (r *Rewriter) rewriteChangeStream(t *Tenant, spec value) ([]value, error) {
+func (r *Rewriter) rewriteChangeStream(t *Tenant, spec value, dbLevel bool) ([]value, error) {
 	d, ok := spec.DocumentOK()
 	if !ok {
 		return nil, badValue("$changeStream requires a document")
@@ -338,8 +348,14 @@ func (r *Rewriter) rewriteChangeStream(t *Tenant, spec value) ([]value, error) {
 			out = append(out, e...)
 		}
 	}
-	out = bsoncore.AppendStringElement(out, "fullDocument", "required")
-	out = bsoncore.AppendStringElement(out, "fullDocumentBeforeChange", "required")
+	// Database-level streams span collections that may not have images yet;
+	// events without an image carry no tenant and are dropped by the $match.
+	mode := "required"
+	if dbLevel {
+		mode = "whenAvailable"
+	}
+	out = bsoncore.AppendStringElement(out, "fullDocument", mode)
+	out = bsoncore.AppendStringElement(out, "fullDocumentBeforeChange", mode)
 	stages := []value{docValue(buildDoc(bsoncore.AppendDocumentElement(nil, "$changeStream", finishDoc(out))))}
 
 	lifecycle := arrayOf(
@@ -355,8 +371,15 @@ func (r *Rewriter) rewriteChangeStream(t *Tenant, spec value) ([]value, error) {
 		docValue(buildDoc(bsoncore.AppendDocumentElement(nil, "operationType",
 			buildDoc(bsoncore.AppendArrayElement(nil, "$in", lifecycle))))),
 	)
-	stages = append(stages, docValue(buildDoc(bsoncore.AppendDocumentElement(nil, "$match",
-		buildDoc(bsoncore.AppendArrayElement(nil, "$or", match))))))
+	filter := buildDoc(bsoncore.AppendArrayElement(nil, "$or", match))
+	if dbLevel {
+		// Never expose the proxy's own bookkeeping collections.
+		internal := buildDoc(bsoncore.AppendDocumentElement(nil, "ns.coll", buildDoc(
+			bsoncore.AppendDocumentElement(nil, "$not", buildDoc(
+				bsoncore.AppendStringElement(nil, "$regex", "^__mtp_"))))))
+		filter = buildDoc(bsoncore.AppendArrayElement(nil, "$and", arrayOf(docValue(internal), docValue(filter))))
+	}
+	stages = append(stages, docValue(buildDoc(bsoncore.AppendDocumentElement(nil, "$match", filter))))
 
 	if clientBefore == "off" {
 		stages = append(stages, docValue(buildDoc(bsoncore.AppendStringElement(nil, "$unset", "fullDocumentBeforeChange"))))

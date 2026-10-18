@@ -102,6 +102,7 @@ func New(cfg Config) *Rewriter {
 		"listCollections": (*Rewriter).cmdListCollections,
 		"create":          (*Rewriter).cmdCreate,
 		"drop":            (*Rewriter).cmdDrop,
+		"mapReduce":       (*Rewriter).cmdMapReduce,
 		"explain":         (*Rewriter).cmdExplain,
 		"listDatabases":   (*Rewriter).cmdListDatabases,
 
@@ -133,7 +134,14 @@ type Result struct {
 	// ChangeStream marks an aggregate that opens a change stream; the proxy
 	// makes sure pre/post images are enabled on the collection first.
 	ChangeStream bool
+	DBLevel      bool // change stream over a whole database (Collection is empty)
 	Collection   string
+	// Alias/Phys are set for reads of a tenant view: replies mention Alias,
+	// the upstream collection is Phys.
+	Alias, Phys string
+	// Before/After are housekeeping commands the proxy runs on the upstream
+	// connection around the main command (index setup, stale-document cleanup).
+	Before, After []Command
 	// Stream is set when the change stream can be served from a shared
 	// upstream stream (fresh start, no custom stages beyond a simple
 	// operationType $match). Otherwise the rewritten Body is a private,
@@ -149,12 +157,16 @@ type Result struct {
 }
 
 type request struct {
-	t    *Tenant
-	db   string
-	cmd  string
-	body doc
-	seqs []wire.Seq
-	e    []bsoncore.Element
+	// noScope is set for reads of a tenant's own (already scoped) view: the
+	// view's pipeline is tenant-confined by construction, so no tenant filter
+	// is added to the client's query.
+	noScope bool
+	t       *Tenant
+	db      string
+	cmd     string
+	body    doc
+	seqs    []wire.Seq
+	e       []bsoncore.Element
 }
 
 type cmdFn func(r *Rewriter, q *request) (*Result, error)
@@ -253,6 +265,12 @@ func (r *Rewriter) scopeFilter(t *Tenant, old *value) (value, error) {
 
 func (r *Rewriter) scopeField(q *request, body doc, key string) (doc, error) {
 	return setField(body, key, func(old *value) (value, bool, error) {
+		if q.noScope {
+			if old == nil {
+				return value{}, false, nil
+			}
+			return *old, true, r.scan(*old)
+		}
 		v, err := r.scopeFilter(q.t, old)
 		return v, true, err
 	})
@@ -264,12 +282,18 @@ func (r *Rewriter) collection(q *request) (string, error) {
 	if !ok {
 		return "", badValue("%s requires a collection name", q.cmd)
 	}
+	if q.noScope {
+		return s, nil // physical view name chosen by the proxy
+	}
 	return s, checkCollName(s)
 }
 
 func checkCollName(s string) error {
 	if s == "" {
 		return badValue("empty collection name")
+	}
+	if strings.HasPrefix(s, "__mtp_") {
+		return deny("collection names starting with __mtp_ are reserved")
 	}
 	if strings.HasPrefix(s, "system.") {
 		return deny("access to %q is not permitted", s)
@@ -351,7 +375,14 @@ func (r *Rewriter) cmdAggregate(q *request) (*Result, error) {
 	if err := noSeqs(q); err != nil {
 		return nil, err
 	}
-	if _, err := r.collection(q); err != nil {
+	ex := &extras{db: q.db}
+	if _, isColl := q.e[0].Value().StringValueOK(); !isColl {
+		// Database-level aggregate: only a change stream over the database.
+		if !r.isDBChangeStream(q) {
+			return nil, deny("database-level aggregate is only supported for $changeStream")
+		}
+		ex.dbLevel = true
+	} else if _, err := r.collection(q); err != nil {
 		return nil, err
 	}
 	b, err := setField(q.body, "pipeline", func(old *value) (value, bool, error) {
@@ -362,18 +393,21 @@ func (r *Rewriter) cmdAggregate(q *request) (*Result, error) {
 		if !ok {
 			return value{}, false, badValue("pipeline must be an array")
 		}
-		np, err := r.scopePipeline(q.t, p, true)
+		np, err := r.scopePipeline(q.t, p, !q.noScope, ex)
 		return arrValue(np), true, err
 	})
 	if err != nil {
 		return nil, err
 	}
-	res := &Result{Body: b}
+	res := &Result{Body: b, Before: ex.before, After: ex.after}
 	if st, err := q.body.Lookup("pipeline").Array().Values(); err == nil && len(st) > 0 {
 		if d, ok := st[0].DocumentOK(); ok {
 			if e, err := d.IndexErr(0); err == nil && e.Key() == "$changeStream" {
 				res.ChangeStream = true
-				res.Collection, _ = r.collection(q)
+				if !ex.dbLevel {
+					res.Collection, _ = r.collection(q)
+				}
+				res.DBLevel = ex.dbLevel
 				res.Stream = streamSpec(q)
 			}
 		}
@@ -919,4 +953,77 @@ func (r *Rewriter) unprefixIndexes(resp bsoncore.Document) bsoncore.Document {
 		return resp
 	}
 	return nr
+}
+
+// ---- helpers for the proxy's view handling -------------------------------
+
+// CheckCollName validates a collection name a tenant supplied.
+func CheckCollName(s string) error { return checkCollName(s) }
+
+// AllowedDB reports whether tenants may use the database.
+func (r *Rewriter) AllowedDB(db string) bool { return r.dbAllowed(db) }
+
+// Denied reports whether a command is disabled by configuration.
+func (r *Rewriter) Denied(cmd string) bool { _, d := r.deny[cmd]; return d }
+
+// ScopeViewPipeline scopes a view definition's pipeline. inject is true when
+// the view reads a shared collection and false when it reads another of the
+// tenant's (already scoped) views.
+func (r *Rewriter) ScopeViewPipeline(t *Tenant, p bsoncore.Array, inject bool) (bsoncore.Array, error) {
+	return r.scopePipeline(t, p, inject, nil)
+}
+
+// RewriteView rewrites a read against a tenant's view, which physically lives
+// in the collection `phys`.
+func (r *Rewriter) RewriteView(t *Tenant, db string, body bsoncore.Document, seqs []wire.Seq, phys string) (*Result, error) {
+	elems, err := body.Elements()
+	if err != nil || len(elems) == 0 {
+		return nil, badValue("malformed command document")
+	}
+	if err := checkNoDuplicateKeys(elems); err != nil {
+		return nil, err
+	}
+	name := elems[0].Key()
+	switch name {
+	case "find", "count", "distinct", "aggregate":
+	default:
+		return nil, &Error{Code: 166, CodeName: "CommandNotSupportedOnView", Msg: "tenant proxy: " + name + " is not supported on views"}
+	}
+	if _, denied := r.deny[name]; denied {
+		return nil, deny("command %q is disabled", name)
+	}
+	if !r.dbAllowed(db) {
+		return nil, deny("database %q is not accessible", db)
+	}
+	out := make([]byte, 4, len(body)+len(phys))
+	out = bsoncore.AppendStringElement(out, name, phys)
+	for _, e := range elems[1:] {
+		out = append(out, e...)
+	}
+	nb := finishDoc(out)
+	ne, _ := nb.Elements()
+	res, err := r.cmds[name](r, &request{t: t, db: db, cmd: name, body: nb, seqs: seqs, e: ne, noScope: true})
+	if err != nil {
+		return nil, err
+	}
+	res.Command, res.DB = name, db
+	return res, nil
+}
+
+// isDBChangeStream reports whether q is `aggregate: 1` whose first stage is
+// $changeStream.
+func (r *Rewriter) isDBChangeStream(q *request) bool {
+	if n, ok := q.e[0].Value().AsInt64OK(); !ok || n != 1 {
+		return false
+	}
+	st, err := q.body.Lookup("pipeline").Array().Values()
+	if err != nil || len(st) == 0 {
+		return false
+	}
+	d, ok := st[0].DocumentOK()
+	if !ok {
+		return false
+	}
+	e, err := d.IndexErr(0)
+	return err == nil && e.Key() == "$changeStream"
 }
