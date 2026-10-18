@@ -143,6 +143,58 @@ On by default (MongoDB 6.0+), collection level. Tenants get the stream a real se
 
 Cost: pre/post images add oplog/storage on watched collections.
 
+## High availability (replica sets)
+
+Point the proxy at a replica set with a multi-host URI or `upstream.hosts`:
+
+```json
+"upstream": {
+  "uri": "mongodb://proxy-user:CHANGE_ME@m1:27017,m2:27017,m3:27017/?replicaSet=rs0&authSource=admin&tls=true",
+  "heartbeatInterval": "5s", "serverSelectionTimeout": "15s", "localThreshold": "15ms"
+}
+```
+
+or, with per-member TLS (each entry is `"host:port"` or an object; unset fields inherit the global `tls`/`caFile`/`insecureSkipVerify`):
+
+```json
+"upstream": {
+  "replicaSet": "rs0",
+  "hosts": ["m1:27017", {"addr": "m2:27017", "tls": true, "caFile": "/etc/ssl/m2-ca.pem", "serverName": "m2.internal"}],
+  "hostMap": {"mongo-2.cluster.local:27017": "10.0.0.12:27017"}
+}
+```
+
+* **Monitoring.** One monitor per member polls `hello` (SDAM): server type (primary / secondary / arbiter / hidden), `setName`, tags, `lastWrite`, `setVersion`/`electionId` (a primary from an older election is ignored), RTT. Members the set advertises are discovered; ones it drops are forgotten. `hostMap` rewrites advertised addresses the proxy can't reach (containers, NAT). A single host without `replicaSet` is used as-is, like `directConnection=true` (set `directConnection=false` to discover from one seed). Standalone servers and mongos work too, with no routing.
+* **Routing.** Writes and default reads go to the primary. Clients still see the proxy as a single mongos-like endpoint, so drivers send `$readPreference` and the proxy honours it for `find`, `aggregate` (without `$out`/`$merge`/`$changeStream`), `count`, `distinct`, `listCollections`, `listIndexes`, `dbStats`, `collStats`: `primary`, `primaryPreferred`, `secondary`, `secondaryPreferred`, `nearest`, `tags` (ordered tag sets) and `maxStalenessSeconds` (≥ 90, estimated as in the SDAM spec). Among eligible members it picks within `localThreshold` of the lowest RTT, preferring the less busy one. An unsatisfiable preference fails after `serverSelectionTimeout` with `FailedToSatisfyReadPreference` (133).
+* **Affinity.** A cursor lives on the member that opened it: `getMore` and `killCursors` are sent back there. Change-stream and tailable cursors also keep their connection; transactions keep their connection from `startTransaction` until commit/abort (an abandoned transaction is aborted when the client disconnects). If the owning member is gone the client gets `CursorNotFound` / `NoSuchTransaction`.
+* **Failover.** Network errors and "not primary" / "shutting down" replies mark the member unknown, flush its pool and trigger an immediate re-check, so the new primary is found in a heartbeat or two instead of a full interval. Commands that waited for no primary retry for up to `serverSelectionTimeout`. `NotWritablePrimary` / `NotPrimaryNoSecondaryOk` / `NotPrimaryOrSecondary` (10107, 13435, 13436) mean the command never ran, so outside transactions the proxy repeats it on the new primary itself. Other failover outcomes are handed to the driver to retry, with the labels it needs: `RetryableWriteError` (writes carrying a `txnNumber` that hit 189 / 11600 / 11602 / 91, or lost their upstream connection) and `TransientTransactionError` (anything that kills a transaction). A read whose connection breaks before any reply byte arrived, and a request that could not be written at all, are repeated on a fresh connection. Housekeeping commands the proxy runs for itself (index setup, view lookups, change-stream image setup) are idempotent and retried once the same way.
+* Metrics: `mtp_upstream_pool_connections{member,state}`, `mtp_upstream_member_info{member,type}`, `mtp_upstream_topology_events_total`, `mtp_upstream_retries_total`.
+
+## Connection pooling
+
+```json
+"upstream": { "pool": { "mode": "pooled", "maxSize": 100, "idleTimeout": "5m", "maxLifetime": "30m", "waitTimeout": "15s" } }
+```
+
+* `mode: "pooled"` (default): a client connection borrows an upstream connection from its member's bounded pool for the duration of one command and gives it back, so thousands of idle or chatty clients share a handful of upstream connections (`maxSize` per member). A connection is held back only while it must be: during a transaction, and for change-stream / tailable cursors. Ordinary cursors, sessions and retryable-write state are server-side and keyed by `lsid`, not by connection, so they need only *member* affinity (above), not a pinned connection. Idle connections are closed after `idleTimeout`, old ones after `maxLifetime`, and a connection the server dropped while idle is detected at checkout. If the pool is exhausted, commands wait up to `waitTimeout` (default `serverSelectionTimeout`) and then fail with `HostUnreachable`.
+* `mode: "dedicated"`: the previous behaviour, one upstream connection per client connection (per member it talks to), for its whole lifetime. Use it if you need strict connection-level semantics or are debugging.
+* A pinned connection counts against `maxSize`: `maxSize` should comfortably exceed the number of concurrent transactions and change streams per member.
+
+## Large replies
+
+Replies up to `streaming.thresholdBytes` (default 256 KiB) are read into memory. Larger replies that need no rewriting (ordinary `find`/`aggregate`/`getMore` batches - the common large case) are relayed to the client in 32 KiB chunks while the proxy follows the BSON structure just far enough to learn the `ok` flag and the cursor id/namespace it must track; memory per relayed reply is constant whatever the batch size. Replies the proxy has to rewrite (`listDatabases`, `listIndexes`, view results, `drop`) are buffered but never beyond `streaming.maxPatchBytes` (default `maxMessageBytes`); larger ones fail with `BSONObjectTooLarge` instead of exhausting memory. `thresholdBytes: -1` disables streaming. `mtp_streamed_replies_total` counts streamed replies.
+
+Benchmark (`go test ./internal/proxy -bench RelayLargeBatch -benchmem`, Apple M4, loopback-free pure relay of one batch of 1 KiB documents):
+
+| batch | mode | time/op | allocated/op | peak heap |
+|---|---|---|---|---|
+| 1 MiB | buffered (before) | 235 µs | 2.1 MB | 7 MiB |
+| 1 MiB | streaming | 91 µs | 352 B | 0.03 MiB |
+| 8 MiB | buffered (before) | 1.47 ms | 17 MB | 16 MiB |
+| 8 MiB | streaming | 0.73 ms | 352 B | 0.03 MiB |
+| 32 MiB | buffered (before) | 6.5 ms | 68 MB | 130 MiB |
+| 32 MiB | streaming | 4.0 ms | 352 B | 0.03 MiB |
+
 ## Run
 
 ```bash
@@ -200,7 +252,7 @@ Users are stored as SCRAM-SHA-256 credentials only (plaintext is never persisted
 ## Performance
 
 * Raw BSON rewriting – no struct decoding. A `find` rewrite is ≈0.85 µs / 33 allocs; stamping a 1,000-document insert is ≈125 µs.
-* One goroutine and one dedicated upstream connection per client connection (cursors, sessions and transactions keep native semantics). Unmodified replies are forwarded as raw bytes.
+* One goroutine per client connection; upstream connections are pooled and shared (see above), and unmodified large replies are streamed in chunks with constant memory. Cursors, sessions and transactions keep native semantics.
 * Measured on a laptop over loopback: point `findOne` ≈24 µs through the proxy vs ≈16 µs direct.
 
 ## `_id` uniqueness (`tenant.idPolicy`)
@@ -287,6 +339,7 @@ Rejections return `code: 8000`, `codeName: "TenantQuotaExceeded"` and a message 
 * `listCollections` filters other than `name`/`type` don't apply to views.
 * Not supported: `GSSAPI`/`PLAIN`/LDAP client authentication, the interactive OIDC (human) flow, speculative authentication in `hello` (drivers fall back to a normal login), and `OP_COMPRESSED` for the legacy `OP_QUERY` handshake.
 * Session ids are bound to the first tenant that uses them ([Sessions](#sessions)); quotas are per proxy process, not shared between proxy replicas ([Quotas](#quotas-tenantlimits)).
+* Upstream routing: `hedge` reads, a proxy-side default read preference (only what the client sends per command is honoured), SRV (`mongodb+srv://`) upstream URIs, and load-balanced mode are not supported. `exhaust` (moreToCome) cursors are not enabled upstream; clients fall back to ordinary getMore. If the primary changes mid-cursor on a *primary* read, the cursor is lost with the old primary, as on a real server.
 
 ## Tests
 
@@ -294,5 +347,6 @@ Rejections return `code: 8000`, `codeName: "TenantQuotaExceeded"` and a message 
 go test ./internal/...            # unit tests (rewriter, audit, metrics, tenants, admin, config)
 go test ./test/ -count=1          # integration: real mongod replica set + official Go driver
 go test ./test/ -bench FindOne -run xxx
+go test ./internal/proxy -bench RelayLargeBatch -benchmem -run xxx   # streaming vs buffered relay
 ```
-Integration tests start their own `mongod` (must be on `PATH`) and cover isolation for CRUD, aggregation stages, cursors, bulk writes, transactions, indexes, and every auth mode (SCRAM-SHA-256/SHA-1, x.509 with generated certificates, OIDC/JWT, appname, static) including auth-enabled and TLS/x.509 upstreams, plus wire compression for each algorithm. `go test ./test/ -bench Compression -run xxx` compares compressors.
+Integration tests start their own `mongod` (must be on `PATH`) and cover isolation for CRUD, aggregation stages, cursors, bulk writes, transactions, indexes, and every auth mode (SCRAM-SHA-256/SHA-1, x.509 with generated certificates, OIDC/JWT, appname, static) including auth-enabled and TLS/x.509 upstreams, plus wire compression for each algorithm. `go test ./test/ -bench Compression -run xxx` compares compressors. The replica-set suite adds a 3-node set for topology discovery, tag/`maxStaleness` secondary reads, cursor affinity, transactions under pool contention, 80 clients multiplexed over a 4-connection pool, repeated `replSetStepDown` failovers with and without driver retries, a shutdown leak check, and dedicated mode.

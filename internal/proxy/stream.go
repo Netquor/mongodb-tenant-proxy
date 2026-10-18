@@ -35,7 +35,7 @@ func (c *conn) openStream(h wire.Header, m *wire.Msg, res *rewrite.Result) (hand
 	// Anchor the stream at the cluster's current operation time: the client
 	// must see events from after this call, not ones the shared stream
 	// happens to still be delivering from before it.
-	pong, err := c.s.dial.RunCommand(c.up, "admin", bsoncore.BuildDocument(nil, bsoncore.AppendInt32Element(nil, "ping", 1)))
+	pong, err := c.runUp(c.rt, "admin", bsoncore.BuildDocument(nil, bsoncore.AppendInt32Element(nil, "ping", 1)))
 	t, i, ok := pong.Lookup("operationTime").TimestampOK()
 	if err != nil || !ok {
 		sub.Close()

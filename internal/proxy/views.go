@@ -61,7 +61,7 @@ func (c *conn) viewsIn(db string) (map[string]*viewDef, error) {
 		return nil, err
 	}
 	filter := bsoncore.BuildDocument(nil, valueElem(c.s.cfg.Tenant.Field, c.tenant.Value))
-	resp, err := c.s.dial.RunCommand(c.up, db, bsoncore.BuildDocument(nil,
+	resp, err := c.runUp(c.rt, db, bsoncore.BuildDocument(nil,
 		bsoncore.AppendStringElement(nil, "find", viewsColl),
 		bsoncore.AppendDocumentElement(nil, "filter", filter),
 		bsoncore.AppendInt32Element(nil, "batchSize", 100000),
@@ -163,7 +163,7 @@ func (c *conn) run(db string, cmd bsoncore.Document) (bsoncore.Document, error) 
 	if err := c.ensureUp(); err != nil {
 		return nil, err
 	}
-	return c.s.dial.RunCommand(c.up, db, cmd)
+	return c.runUp(c.rt, db, cmd)
 }
 
 func failed(resp bsoncore.Document) bool {

@@ -128,6 +128,12 @@ type Registry struct {
 	ConnsActive Gauge
 	BytesIn     Counter
 	BytesOut    Counter
+	// StreamedReplies counts upstream replies relayed in chunks;
+	// UpstreamRetries counts commands repeated on another connection or member.
+	StreamedReplies Counter
+	UpstreamRetries Counter
+	// Collectors append extra Prometheus text (upstream topology and pools).
+	Collectors []func(io.Writer)
 
 	mu       sync.Mutex
 	commands map[string]*Counter // "command|outcome"
@@ -251,6 +257,11 @@ func (r *Registry) write(w io.Writer) {
 	fmt.Fprintf(w, "# TYPE mtp_connections_active gauge\nmtp_connections_active %d\n", r.ConnsActive.v.Load())
 	fmt.Fprintf(w, "# TYPE mtp_client_bytes_total counter\nmtp_client_bytes_total{direction=\"in\"} %d\nmtp_client_bytes_total{direction=\"out\"} %d\n",
 		r.BytesIn.v.Load(), r.BytesOut.v.Load())
+	fmt.Fprintf(w, "# TYPE mtp_streamed_replies_total counter\nmtp_streamed_replies_total %d\n", r.StreamedReplies.v.Load())
+	fmt.Fprintf(w, "# TYPE mtp_upstream_retries_total counter\nmtp_upstream_retries_total %d\n", r.UpstreamRetries.v.Load())
+	for _, f := range r.Collectors {
+		f(w)
+	}
 	r.mu.Lock()
 	keys := make([]string, 0, len(r.commands))
 	for k := range r.commands {

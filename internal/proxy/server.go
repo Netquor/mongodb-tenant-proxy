@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -97,8 +98,10 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	d.SetLogger(log)
 	h, err := d.Hello(ctx)
 	if err != nil {
+		d.Close()
 		return nil, fmt.Errorf("probing upstream %s: %w", cfg.Upstream.Addr, err)
 	}
 	get := func(k string, def int32) int32 {
@@ -116,7 +119,8 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		sessionTimeout: get("logicalSessionTimeoutMinutes", 30),
 	}
 	s.sess = newSessionTable(s.limits.sessionTimeout, nil)
-	log.Info("upstream reachable", "addr", cfg.Upstream.Addr, "maxWireVersion", s.limits.maxWire)
+	s.M.Collectors = append(s.M.Collectors, s.writeUpstreamMetrics)
+	log.Info("upstream reachable", "hosts", len(cfg.Upstream.HostList()), "pooled", d.Pooled(), "maxWireVersion", s.limits.maxWire)
 	return s, nil
 }
 
@@ -162,9 +166,13 @@ func (s *Server) shutdown() {
 	}
 	s.mu.Unlock()
 	s.wg.Wait()
+	s.dial.Close()
 	s.audit.Close()
 	s.reg.Close()
 }
+
+// UpstreamStats reports the state of the upstream topology and pools.
+func (s *Server) UpstreamStats() upstream.Stats { return s.dial.Stats() }
 
 // acquireTenant enforces the per-tenant connection cap.
 func (s *Server) acquireTenant(id string) bool {
@@ -190,3 +198,15 @@ func (s *Server) releaseTenant(id string) {
 }
 
 func (s *Server) dbWatched(db string) bool { _, ok := s.dbStreams.Load(db); return ok }
+
+func (s *Server) writeUpstreamMetrics(w io.Writer) {
+	st := s.dial.Stats()
+	fmt.Fprintf(w, "# TYPE mtp_upstream_connections gauge\nmtp_upstream_connections %d\n", st.OpenConns)
+	fmt.Fprintf(w, "# TYPE mtp_upstream_topology_events_total counter\nmtp_upstream_topology_events_total %d\n", st.TopologyEvents)
+	fmt.Fprintf(w, "# TYPE mtp_upstream_pool_connections gauge\n")
+	for _, m := range st.Members {
+		fmt.Fprintf(w, "mtp_upstream_pool_connections{member=%q,state=\"in_use\"} %d\n", m.Addr, m.InUse)
+		fmt.Fprintf(w, "mtp_upstream_pool_connections{member=%q,state=\"idle\"} %d\n", m.Addr, m.Idle)
+		fmt.Fprintf(w, "mtp_upstream_member_info{member=%q,type=%q} 1\n", m.Addr, m.Type)
+	}
+}

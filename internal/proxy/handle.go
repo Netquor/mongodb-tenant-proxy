@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/netquor/mongodb-tenant-proxy/internal/auth"
 	"github.com/netquor/mongodb-tenant-proxy/internal/rewrite"
+	"github.com/netquor/mongodb-tenant-proxy/internal/upstream"
 	"github.com/netquor/mongodb-tenant-proxy/internal/wire"
 )
 
@@ -24,6 +24,14 @@ func (c *conn) handleMsg(h wire.Header, body []byte) error {
 	c.beginCmd(name, db)
 	if err := rewrite.ValidateBody(m.Body); err != nil {
 		return c.reply(h, toErrorDoc(err))
+	}
+	rt, rtErr := c.planRoute(name, m.Body)
+	if rtErr != nil {
+		return c.reply(h, errorDoc(2, "BadValue", "invalid $readPreference: "+rtErr.Error()))
+	}
+	c.rt = rt
+	if rt.startTxn {
+		c.txnBody = txnAbortBody(m.Body)
 	}
 
 	if rel, bad := c.admit(name, m, len(body)); bad != nil {
@@ -95,22 +103,12 @@ func (c *conn) handleMsg(h wire.Header, body []byte) error {
 	return c.forward(h, m.Flags, res, 0)
 }
 
+// ensureUp makes sure the command in progress has an upstream connection.
 func (c *conn) ensureUp() error {
 	if c.up != nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), c.s.cfg.DialDuration())
-	defer cancel()
-	up, err := c.s.dial.Dial(ctx)
-	if err != nil {
-		return err
-	}
-	c.up = up
-	if c.tenant != nil {
-		c.upAddr = up.LocalAddr().String()
-		c.s.registerUp(c.tenant.ID, c.upAddr)
-	}
-	return nil
+	return c.useUp(c.rt)
 }
 
 // forward sends a rewritten command upstream and relays the reply.
@@ -118,16 +116,17 @@ func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMore
 	if err := c.applyMaxTime(res); err != nil {
 		return c.reply(h, toErrorDoc(err))
 	}
-	if err := c.ensureUp(); err != nil {
-		c.log.Error("upstream dial failed", "err", err)
+	if err := c.useUp(c.rt); err != nil {
+		c.log.Error("upstream unavailable", "err", err)
 		c.cmdDone(res.Command, "error")
-		return c.reply(h, errorDoc(6, "HostUnreachable", "tenant proxy: upstream unavailable"))
+		return c.reply(h, c.upstreamError(c.rt, err))
 	}
 	if !c.s.cfg.ChangeStreams.DisableAutoImages && c.s.dbWatched(res.DB) {
 		// A database-level stream is open: collections created from now on
 		// need pre/post images before their first write.
 		if coll := writeTarget(res); coll != "" {
-			if err := c.s.dial.EnsureImages(c.up, res.DB, coll); err != nil {
+			err := c.retryUp(c.rt, func(u *upstream.Conn) error { return c.s.dial.EnsureImages(u, res.DB, coll) })
+			if err != nil {
 				c.log.Warn("enabling change stream images failed", "coll", coll, "err", err)
 			}
 		}
@@ -136,12 +135,12 @@ func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMore
 		c.s.dbStreams.Store(res.DB, struct{}{})
 	}
 	if res.ChangeStream && !c.s.cfg.ChangeStreams.DisableAutoImages {
-		var err error
-		if res.DBLevel {
-			err = c.s.dial.EnsureImagesDB(c.up, res.DB)
-		} else {
-			err = c.s.dial.EnsureImages(c.up, res.DB, res.Collection)
-		}
+		err := c.retryUp(c.rt, func(u *upstream.Conn) error {
+			if res.DBLevel {
+				return c.s.dial.EnsureImagesDB(u, res.DB)
+			}
+			return c.s.dial.EnsureImages(u, res.DB, res.Collection)
+		})
 		if err != nil {
 			c.log.Error("enabling change stream images failed", "err", err)
 			return c.reply(h, errorDoc(8, "UnknownError", "tenant proxy: could not enable change stream images: "+err.Error()))
@@ -156,99 +155,7 @@ func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMore
 		Body:  res.Body,
 		Seqs:  res.Seqs,
 	}
-	if err := c.writeUp(h.RequestID, res.Command, out.Encode()); err != nil {
-		return fmt.Errorf("upstream write: %w", err)
-	}
-	if flags&wire.FlagMoreToCome != 0 {
-		c.cmdDone(res.Command, "ok")
-		return nil // unacknowledged write: no reply
-	}
-	needParse := res.Post != nil || res.Alias != "" || len(res.After) > 0 || tracksCursor(res.Command)
-	rh, rb, raw, err := c.readUp(needParse)
-	if err != nil {
-		return err
-	}
-	if !raw && c.lim != nil && c.lim.L.MaxResultBytes > 0 && len(rb) > c.lim.L.MaxResultBytes {
-		return c.oversize(h, rb, res, getMoreID)
-	}
-	if needParse {
-		rm, err := wire.ParseMsg(rb)
-		if err != nil {
-			return err
-		}
-		if len(res.After) > 0 {
-			if ok, _ := rm.Body.Lookup("ok").AsInt64OK(); ok == 1 {
-				if bad := c.runSteps(res.After); bad != nil {
-					c.cmdDone(res.Command, "error")
-					return c.reply(h, bad)
-				}
-			}
-		}
-		if res.Post != nil {
-			rm.Body = res.Post(rm.Body)
-			rb = rm.Encode()
-		}
-		if res.Alias != "" {
-			rm.Body = patchCursorNS(rm.Body, res.DB+"."+res.Alias)
-			rb = rm.Encode()
-			c.noteViewCursor(rm.Body, res.Phys, getMoreID)
-		}
-		c.trackCursor(res.Command, getMoreID, rm.Body)
-		if res.IDCursor {
-			c.noteIDCursor(res.Command, getMoreID, rm.Body)
-		}
-	}
-	c.cmdDone(res.Command, "ok")
-	c.countOut(int64(len(rb) + 16))
-	if c.lim != nil {
-		c.lim.CountReply(len(rb) + 16)
-	}
-	if raw {
-		// Compressed by the upstream with the compressor the client
-		// negotiated: relay it without recompressing.
-		return wire.WriteFrame(c.nc, rh.RequestID, h.RequestID, wire.OpCompressed, rb)
-	}
-	return c.send(rh.RequestID, h.RequestID, wire.OpMsg, rb)
-}
-
-// writeUp sends a request upstream, compressing it when the upstream
-// connection negotiated compression and the command may be compressed.
-func (c *conn) writeUp(requestID int32, cmd string, body []byte) error {
-	if c.up.Comp != wire.CompNone && wire.Compressible(cmd) {
-		cb, err := wire.Compress(c.up.Comp, wire.OpMsg, body)
-		if err != nil {
-			return err
-		}
-		return wire.WriteFrame(c.up, requestID, 0, wire.OpCompressed, cb)
-	}
-	return wire.WriteFrame(c.up, requestID, 0, wire.OpMsg, body)
-}
-
-// readUp reads the upstream reply as an uncompressed OP_MSG body. When the
-// reply is OP_COMPRESSED with the compressor the client expects and the
-// caller does not need to parse it, the compressed body is returned as is
-// (raw=true) so it can be relayed without touching the payload.
-func (c *conn) readUp(needParse bool) (h wire.Header, body []byte, raw bool, err error) {
-	h, body, err = wire.ReadFrame(c.up.R, c.s.cfg.MaxMessageBytes)
-	if err != nil {
-		return h, nil, false, fmt.Errorf("upstream read: %w", err)
-	}
-	switch h.OpCode {
-	case wire.OpMsg:
-		return h, body, false, nil
-	case wire.OpCompressed:
-		if id, ok := wire.CompressorID(body); ok && !needParse && id == c.reqComp && id != wire.CompNone {
-			return h, body, true, nil
-		}
-		op, _, data, err := wire.Decompress(body, c.s.cfg.MaxMessageBytes)
-		if err != nil {
-			return h, nil, false, fmt.Errorf("upstream read: %w", err)
-		}
-		if op == wire.OpMsg {
-			return h, data, false, nil
-		}
-	}
-	return h, nil, false, errors.New("unexpected upstream opcode")
+	return c.exchange(h, flags, res, getMoreID, out.Encode())
 }
 
 func tracksCursor(cmd string) bool {
@@ -263,9 +170,7 @@ func tracksCursor(cmd string) bool {
 // killCursors can only ever address cursors this tenant created.
 func (c *conn) trackCursor(cmd string, getMoreID int64, resp bsoncore.Document) {
 	if ok, _ := resp.Lookup("ok").AsInt64OK(); ok != 1 {
-		if cmd == "getMore" {
-			delete(c.cursors, getMoreID)
-		}
+		c.noteCursor(cmd, getMoreID, false, 0, "")
 		return
 	}
 	cur, ok := resp.Lookup("cursor").DocumentOK()
@@ -273,16 +178,41 @@ func (c *conn) trackCursor(cmd string, getMoreID int64, resp bsoncore.Document) 
 		return
 	}
 	id, _ := cur.Lookup("id").AsInt64OK()
+	ns, _ := cur.Lookup("ns").StringValueOK()
+	c.noteCursor(cmd, getMoreID, true, id, ns)
+}
+
+// noteCursor is trackCursor on already-extracted fields (the streaming relay
+// never materialises the reply document).
+func (c *conn) noteCursor(cmd string, getMoreID int64, ok bool, id int64, ns string) {
+	if !ok {
+		if cmd == "getMore" {
+			c.forgetCursor(getMoreID)
+		}
+		return
+	}
 	switch {
 	case id == 0 && cmd == "getMore":
-		delete(c.cursors, getMoreID)
-		delete(c.viewPhys, getMoreID)
+		c.forgetCursor(getMoreID)
 	case id != 0 && cmd != "getMore":
 		if len(c.cursors) < maxCursorsPerConn {
-			ns, _ := cur.Lookup("ns").StringValueOK()
 			c.cursors[id] = ns
+			if c.up != nil {
+				c.cursorAt[id] = c.up.Addr
+			}
+			if c.rt.tail {
+				c.pinTail(id)
+			}
 		}
 	}
+}
+
+func (c *conn) forgetCursor(id int64) {
+	delete(c.cursors, id)
+	delete(c.idCursors, id)
+	delete(c.viewPhys, id)
+	delete(c.cursorAt, id)
+	c.unpinTail(id)
 }
 
 func (c *conn) handleGetMore(h wire.Header, m *wire.Msg, db string) error {
@@ -297,6 +227,12 @@ func (c *conn) handleGetMore(h wire.Header, m *wire.Msg, db string) error {
 		return c.reply(h, errorDoc(43, "CursorNotFound", fmt.Sprintf("cursor id %d not found", id)))
 	}
 	res := &rewrite.Result{Command: "getMore", DB: db, Body: m.Body}
+	// A cursor lives on one member, and change-stream / tailable cursors on
+	// one connection: the getMore must go back there. It is never repeated.
+	c.rt.read = false
+	c.rt.sel = upstream.Selector{Addr: c.cursorAt[id]}
+	c.rt.pinned = c.tails[id]
+	c.rt.tail = c.tails[id] != nil
 	if c.idCursors[id] {
 		res.IDCursor, res.Post = true, c.s.rt().rw.IDPost(c.tenant)
 	}
@@ -357,16 +293,30 @@ func (c *conn) handleKillCursors(h wire.Header, m *wire.Msg, db string) error {
 	n := len(nb)
 	nb[0], nb[1], nb[2], nb[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
 	for _, id := range ownedIDs {
-		delete(c.cursors, id)
-		delete(c.idCursors, id)
-	}
-	for _, id := range ownedIDs {
 		if phys, isView := c.viewPhys[id]; isView {
 			nb = withString(nb, "killCursors", phys)
-			delete(c.viewPhys, id)
 		}
 	}
-	return c.forward(h, m.Flags, &rewrite.Result{Command: "killCursors", DB: db, Body: nb}, 0)
+	// Cursors can live on different members; the first group is killed by
+	// the command itself, any others best-effort.
+	first := c.cursorAt[ownedIDs[0]]
+	c.rt.read = false
+	c.rt.sel = upstream.Selector{Addr: first}
+	c.rt.pinned = c.tails[ownedIDs[0]]
+	rest := map[string][]int64{}
+	for _, id := range ownedIDs {
+		if a := c.cursorAt[id]; a != first {
+			rest[a] = append(rest[a], id)
+		}
+	}
+	err = c.forward(h, m.Flags, &rewrite.Result{Command: "killCursors", DB: db, Body: nb}, 0)
+	for a, ids := range rest {
+		c.killAt(a, db+"."+coll, ids)
+	}
+	for _, id := range ownedIDs {
+		c.forgetCursor(id)
+	}
+	return err
 }
 
 // ---- handshake -----------------------------------------------------------
@@ -630,7 +580,7 @@ steps:
 			}
 			continue
 		}
-		resp, err := c.s.dial.RunCommand(c.up, cmd.DB, cmd.Body)
+		resp, err := c.runUp(c.rt, cmd.DB, cmd.Body)
 		if err != nil {
 			return errorDoc(6, "HostUnreachable", "tenant proxy: "+err.Error())
 		}
