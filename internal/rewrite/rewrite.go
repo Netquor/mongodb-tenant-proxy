@@ -8,6 +8,7 @@
 package rewrite
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"strconv"
@@ -181,7 +182,11 @@ func CommandName(body bsoncore.Document) string {
 }
 
 // Rewrite applies tenant scoping to a command.
-func (r *Rewriter) Rewrite(t *Tenant, db string, body bsoncore.Document, seqs []wire.Seq) (*Result, error) {
+func (r *Rewriter) Rewrite(t *Tenant, db string, body bsoncore.Document, seqs []wire.Seq) (res *Result, err error) {
+	defer recoverRewrite(&res, &err)
+	if err := validateCommand(body, seqs); err != nil {
+		return nil, err
+	}
 	elems, err := body.Elements()
 	if err != nil || len(elems) == 0 {
 		return nil, badValue("malformed command document")
@@ -204,13 +209,98 @@ func (r *Rewriter) Rewrite(t *Tenant, db string, body bsoncore.Document, seqs []
 		return nil, deny("database %q is not accessible", db)
 	}
 	q := &request{t: t, db: db, cmd: name, body: body, seqs: seqs, e: elems}
-	res, err := fn(r, q)
+	if err := r.vet(q); err != nil {
+		return nil, err
+	}
+	res, err = fn(r, q)
 	if err != nil {
 		return nil, err
 	}
 	res.Command = name
 	res.DB = db
 	return res, nil
+}
+
+// recoverRewrite turns a panic in the rewriter into an error. The rewriter
+// parses hostile input with accessors that panic on malformed data; validateCommand
+// should make that unreachable, but a bug here must never take down the
+// proxy (and with it every other tenant's connection).
+func recoverRewrite(res **Result, err *error) {
+	if p := recover(); p != nil {
+		*res, *err = nil, errInternal()
+	}
+}
+
+func errInternal() error {
+	return &Error{Code: 8, CodeName: "UnknownError", Msg: "tenant proxy: internal error while rewriting the command"}
+}
+
+// vet applies checks that hold for every command: server-side JavaScript
+// anywhere in the command (not only in the filter positions the individual
+// rewriters scan), and collations that could blur tenant ids together.
+func (r *Rewriter) vet(q *request) error {
+	if !r.js {
+		for _, e := range q.e {
+			if q.cmd == "insert" && e.Key() == "documents" {
+				continue // user data, not an expression
+			}
+			if _, bad := forbiddenKeys[e.Key()]; bad {
+				return deny("operator %s is not permitted", e.Key())
+			}
+			if err := scanForbidden(e.Value()); err != nil {
+				return err
+			}
+		}
+		if q.cmd != "insert" {
+			for _, s := range q.seqs {
+				for _, d := range s.Docs {
+					if err := scanDoc(d); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	if c := q.body.Lookup("collation"); c.Type != 0 {
+		if err := checkCollation(c); err != nil {
+			return err
+		}
+	}
+	vetStmts := func(d doc) error {
+		if c := d.Lookup("collation"); c.Type != 0 {
+			return checkCollation(c)
+		}
+		return nil
+	}
+	key := ""
+	switch q.cmd {
+	case "update":
+		key = "updates"
+	case "delete":
+		key = "deletes"
+	case "createIndexes":
+		key = "indexes"
+	}
+	if key != "" {
+		if a, ok := q.body.Lookup(key).ArrayOK(); ok {
+			vals, _ := a.Values()
+			for _, v := range vals {
+				if d, ok := v.DocumentOK(); ok {
+					if err := vetStmts(d); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		for _, s := range q.seqs {
+			for _, d := range s.Docs {
+				if err := vetStmts(d); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (r *Rewriter) adminCmd(name string) bool {
@@ -223,14 +313,14 @@ func (r *Rewriter) adminCmd(name string) bool {
 }
 
 func (r *Rewriter) dbAllowed(db string) bool {
-	if db == "" {
+	if db == "" || len(db) > 63 || strings.ContainsAny(db, "/\\. \"$*<>:|?\x00") {
 		return false
 	}
 	if len(r.dbs) > 0 {
 		_, ok := r.dbs[db]
 		return ok
 	}
-	switch db {
+	switch strings.ToLower(db) {
 	case "admin", "local", "config":
 		return false
 	}
@@ -300,6 +390,25 @@ func checkCollName(s string) error {
 	}
 	if strings.ContainsAny(s, "$\x00") {
 		return badValue("invalid collection name %q", s)
+	}
+	return nil
+}
+
+// sectionShape makes sure the statements of a write command can only be
+// reached through the paths the rewriter rewrites: the field, if present in the
+// body, must be a real array (not a document the server might also accept as
+// an array), and it may not be supplied twice (body and document sequence).
+func sectionShape(q *request, key string) error {
+	v := q.body.Lookup(key)
+	if v.Type != 0 && v.Type != bsoncore.TypeArray {
+		return badValue("%s must be an array", key)
+	}
+	if v.Type != 0 {
+		for _, s := range q.seqs {
+			if s.ID == key {
+				return badValue("%s supplied both in the body and as a document sequence", key)
+			}
+		}
 	}
 	return nil
 }
@@ -400,7 +509,8 @@ func (r *Rewriter) cmdAggregate(q *request) (*Result, error) {
 		return nil, err
 	}
 	res := &Result{Body: b, Before: ex.before, After: ex.after}
-	if st, err := q.body.Lookup("pipeline").Array().Values(); err == nil && len(st) > 0 {
+	if pa, ok := q.body.Lookup("pipeline").ArrayOK(); !ok {
+	} else if st, err := pa.Values(); err == nil && len(st) > 0 {
 		if d, ok := st[0].DocumentOK(); ok {
 			if e, err := d.IndexErr(0); err == nil && e.Key() == "$changeStream" {
 				res.ChangeStream = true
@@ -454,6 +564,9 @@ func (r *Rewriter) cmdInsert(q *request) (*Result, error) {
 	}
 	res := &Result{Body: q.body}
 	var err error
+	if err := sectionShape(q, "documents"); err != nil {
+		return nil, err
+	}
 	if _, ok := q.body.Lookup("documents").ArrayOK(); ok {
 		res.Body, err = setField(q.body, "documents", func(old *value) (value, bool, error) {
 			a, _ := old.ArrayOK()
@@ -479,6 +592,9 @@ func (r *Rewriter) cmdInsert(q *request) (*Result, error) {
 func (r *Rewriter) rewriteStatements(q *request, key string, fn func(doc) (doc, error)) (*Result, error) {
 	res := &Result{Body: q.body}
 	var err error
+	if err := sectionShape(q, key); err != nil {
+		return nil, err
+	}
 	if _, ok := q.body.Lookup(key).ArrayOK(); ok {
 		res.Body, err = setField(q.body, key, func(old *value) (value, bool, error) {
 			a, _ := old.ArrayOK()
@@ -556,6 +672,9 @@ func (r *Rewriter) rewriteUpdateSpec(t *Tenant, u value) (value, error) {
 		if err != nil {
 			return value{}, badValue("malformed update pipeline")
 		}
+		if len(stages) > maxPipelineStages {
+			return value{}, badValue("update pipeline exceeds %d stages", maxPipelineStages)
+		}
 		out := make([]value, 0, len(stages)+1)
 		for _, s := range stages {
 			sd, ok := s.DocumentOK()
@@ -623,6 +742,20 @@ func (r *Rewriter) rewriteUpdateSpec(t *Tenant, u value) (value, error) {
 	return value{}, badValue("update must be a document or pipeline")
 }
 
+// onlyTenantField reports whether every field of an index key is the tenant field.
+func (r *Rewriter) onlyTenantField(key doc) bool {
+	els, err := key.Elements()
+	if err != nil {
+		return false
+	}
+	for _, e := range els {
+		if !r.touchesTenant(e.Key()) {
+			return false
+		}
+	}
+	return len(els) > 0
+}
+
 func (r *Rewriter) touchesTenant(path string) bool {
 	return path == r.field || strings.HasPrefix(path, r.field+".")
 }
@@ -659,9 +792,17 @@ func (r *Rewriter) cmdCreate(q *request) (*Result, error) {
 	if _, err := r.collection(q); err != nil {
 		return nil, err
 	}
-	for _, k := range []string{"viewOn", "pipeline", "clone", "timeseries"} {
-		if q.body.Lookup(k).Type != 0 {
-			return nil, deny("create option %q is not permitted", k)
+	// The physical collection is shared by every tenant, so a tenant must not
+	// configure it: capped/size (evicts other tenants' data), validator
+	// (rejects their writes), collation (changes how their queries compare),
+	// clusteredIndex/expireAfterSeconds (TTL deletes), storage options, ...
+	// Only transport/session plumbing is passed through.
+	for _, e := range q.e[1:] {
+		switch e.Key() {
+		case "comment", "writeConcern", "lsid", "txnNumber", "$clusterTime", "$db", "$readPreference",
+			"autocommit", "startTransaction", "readConcern", "apiVersion", "apiStrict", "apiDeprecationErrors", "$audit":
+		default:
+			return nil, deny("create option %q is not permitted: the collection is shared between tenants", e.Key())
 		}
 	}
 	return &Result{Body: q.body}, nil
@@ -712,11 +853,33 @@ func (r *Rewriter) cmdDrop(q *request) (*Result, error) {
 	}}, nil
 }
 
+// hiddenColl matches the proxy's bookkeeping collections and system
+// collections, which tenants must never see.
+func hiddenColl() doc {
+	return buildDoc(bsoncore.AppendDocumentElement(nil, "name", buildDoc(
+		bsoncore.AppendDocumentElement(nil, "$not", buildDoc(
+			bsoncore.AppendStringElement(nil, "$regex", `^(__mtp_|system\.)`))))))
+}
+
 func (r *Rewriter) cmdListCollections(q *request) (*Result, error) {
 	if err := noSeqs(q); err != nil {
 		return nil, err
 	}
-	return &Result{Body: q.body}, nil
+	// Hide internal collections on the server side so every batch (including
+	// getMore pages the proxy never post-processes) is clean.
+	b, err := setField(q.body, "filter", func(old *value) (value, bool, error) {
+		if old == nil {
+			return docValue(hiddenColl()), true, nil
+		}
+		if _, ok := old.DocumentOK(); !ok {
+			return value{}, false, badValue("filter must be a document")
+		}
+		return docValue(buildDoc(bsoncore.AppendArrayElement(nil, "$and", arrayOf(docValue(hiddenColl()), *old)))), true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Result{Body: b}, nil
 }
 
 func (r *Rewriter) cmdListDatabases(q *request) (*Result, error) {
@@ -786,7 +949,11 @@ func (r *Rewriter) cmdExplain(q *request) (*Result, error) {
 	if _, denied := r.deny[name]; denied {
 		return nil, deny("command %q is disabled", name)
 	}
-	res, err := r.cmds[name](r, &request{t: q.t, db: q.db, cmd: name, body: inner, e: elems})
+	iq := &request{t: q.t, db: q.db, cmd: name, body: inner, e: elems, noScope: q.noScope}
+	if err := r.vet(iq); err != nil {
+		return nil, err
+	}
+	res, err := r.cmds[name](r, iq)
 	if err != nil {
 		return nil, err
 	}
@@ -805,6 +972,9 @@ func (r *Rewriter) indexKey(key doc) (doc, error) {
 	elems, err := key.Elements()
 	if err != nil || len(elems) == 0 {
 		return nil, badValue("invalid index key")
+	}
+	if err := checkKeyNames(key); err != nil {
+		return nil, err
 	}
 	if elems[0].Key() == r.field || (len(elems) == 1 && elems[0].Key() == "_id") {
 		return key, nil
@@ -841,13 +1011,22 @@ func (r *Rewriter) cmdCreateIndexes(q *request) (*Result, error) {
 					return nil, err
 				}
 			}
+			if n := spec.Lookup("name"); n.Type != 0 {
+				s, ok := n.StringValueOK()
+				if !ok {
+					return nil, badValue("index name must be a string")
+				}
+				if strings.HasPrefix(s, "mtp_") || strings.Contains(s, indexTagMark) {
+					return nil, deny("index names containing %q or starting with mtp_ are reserved", indexTagMark)
+				}
+			}
 			// TTL indexes must be single-field, so they cannot carry the
 			// tenant prefix; a unique TTL index would be global, so refuse it.
 			if spec.Lookup("expireAfterSeconds").Type != 0 {
-				if u, _ := spec.Lookup("unique").BooleanOK(); u {
+				if u := spec.Lookup("unique"); u.Type != 0 && truthy(u) {
 					return nil, deny("unique TTL indexes cannot be tenant-scoped")
 				}
-				return spec, nil
+				return r.privateTTL(q.t, spec)
 			}
 			return setField(spec, "key", func(old *value) (value, bool, error) {
 				if old == nil {
@@ -858,6 +1037,11 @@ func (r *Rewriter) cmdCreateIndexes(q *request) (*Result, error) {
 					return value{}, false, badValue("index key must be a document")
 				}
 				nk, err := r.indexKey(kd)
+				if err == nil {
+					if u := spec.Lookup("unique"); u.Type != 0 && truthy(u) && r.onlyTenantField(nk) {
+						return value{}, false, deny("a unique index on %q alone would limit every tenant to one document", r.field)
+					}
+				}
 				return docValue(nk), true, err
 			})
 		})
@@ -867,6 +1051,102 @@ func (r *Rewriter) cmdCreateIndexes(q *request) (*Result, error) {
 		return nil, err
 	}
 	return &Result{Body: b}, nil
+}
+
+// indexTagMark separates a client-visible index name from the tag of the
+// tenant that owns it. Only tenant-private indexes (TTL) carry a tag.
+const indexTagMark = "__mtp_t"
+
+func indexTag(t *Tenant) string {
+	h := sha256.Sum256([]byte(t.ID))
+	return indexTagMark + hex.EncodeToString(h[:6])
+}
+
+func truthy(v value) bool {
+	switch v.Type {
+	case bsoncore.TypeBoolean:
+		b, _ := v.BooleanOK()
+		return b
+	case bsoncore.TypeNull:
+		return false
+	}
+	if f, ok := v.AsFloat64OK(); ok {
+		return f != 0
+	}
+	return true
+}
+
+// privateTTL confines a TTL index to the tenant. A TTL index is single-field,
+// so it cannot carry the tenant prefix, and on a shared collection it would
+// delete every tenant's expired documents, not just the creator's. Adding the
+// tenant to the partial filter expression restricts the index (and so the
+// expiry) to the creator's documents; the name carries a per-tenant tag so
+// two tenants can each have their own index on the same field.
+func (r *Rewriter) privateTTL(t *Tenant, spec doc) (doc, error) {
+	key, ok := spec.Lookup("key").DocumentOK()
+	if !ok {
+		return nil, badValue("index requires key")
+	}
+	if err := checkKeyNames(key); err != nil {
+		return nil, err
+	}
+	name, ok := spec.Lookup("name").StringValueOK()
+	if !ok {
+		name = defaultIndexName(key)
+		if strings.HasPrefix(name, "mtp_") {
+			name = "k_" + name
+		}
+	}
+	spec, err := setField(spec, "partialFilterExpression", func(old *value) (value, bool, error) {
+		if old == nil {
+			return docValue(r.tenantDoc(t)), true, nil
+		}
+		od, ok := old.DocumentOK()
+		if !ok {
+			return value{}, false, badValue("partialFilterExpression must be a document")
+		}
+		return docValue(buildDoc(bsoncore.AppendArrayElement(nil, "$and", arrayOf(docValue(r.tenantDoc(t)), docValue(od))))), true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return setField(spec, "name", func(*value) (value, bool, error) {
+		return value{Type: bsoncore.TypeString, Data: bsoncore.AppendString(nil, name+indexTag(t))}, true, nil
+	})
+}
+
+// checkKeyNames keeps the proxy's reserved markers out of server-generated
+// index names.
+func checkKeyNames(key doc) error {
+	els, err := key.Elements()
+	if err != nil {
+		return badValue("invalid index key")
+	}
+	for _, e := range els {
+		if strings.Contains(e.Key(), indexTagMark) {
+			return deny("index key fields containing %q are reserved", indexTagMark)
+		}
+	}
+	return nil
+}
+
+// defaultIndexName mirrors the server's default index naming (field_dir_...).
+func defaultIndexName(key doc) string {
+	els, _ := key.Elements()
+	parts := make([]string, 0, len(els))
+	for _, e := range els {
+		v := e.Value()
+		var ds string
+		if s, ok := v.StringValueOK(); ok {
+			ds = s
+		} else if f, ok := v.AsFloat64OK(); ok {
+			ds = strconv.FormatFloat(f, 'f', -1, 64)
+		} else {
+			ds = "x"
+		}
+		parts = append(parts, e.Key()+"_"+ds)
+	}
+	return strings.Join(parts, "_")
 }
 
 func (r *Rewriter) cmdDropIndexes(q *request) (*Result, error) {
@@ -888,6 +1168,12 @@ func (r *Rewriter) cmdDropIndexes(q *request) (*Result, error) {
 			}
 			if s == "_id_" {
 				return value{}, false, deny("the _id index cannot be dropped")
+			}
+			if strings.HasPrefix(s, "mtp_") {
+				return value{}, false, deny("index %q is managed by the proxy", s)
+			}
+			if i := strings.Index(s, indexTagMark); i >= 0 && s[i:] != indexTag(q.t) {
+				return value{}, false, deny("index %q belongs to another tenant", s)
 			}
 			return *old, true, nil
 		case bsoncore.TypeEmbeddedDocument:
@@ -911,12 +1197,22 @@ func (r *Rewriter) cmdListIndexes(q *request) (*Result, error) {
 	if _, err := r.collection(q); err != nil {
 		return nil, err
 	}
-	return &Result{Body: q.body, Post: r.unprefixIndexes}, nil
+	// Indexes are few (the server caps them at 64), so ask for them in one
+	// batch: later getMore pages are not post-processed, and would otherwise
+	// expose other tenants' private indexes.
+	b, err := setField(q.body, "cursor", func(*value) (value, bool, error) {
+		return docValue(buildDoc(bsoncore.AppendInt32Element(nil, "batchSize", 1000))), true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &Result{Body: b, Post: func(resp bsoncore.Document) bsoncore.Document { return r.unprefixIndexes(q.t, resp) }}, nil
 }
 
 // unprefixIndexes hides the tenant prefix from listIndexes output so clients
-// see the keys they originally asked for.
-func (r *Rewriter) unprefixIndexes(resp bsoncore.Document) bsoncore.Document {
+// see the keys they originally asked for, and hides indexes that belong to
+// other tenants (their names, keys and partial filters carry tenant ids).
+func (r *Rewriter) unprefixIndexes(t *Tenant, resp bsoncore.Document) bsoncore.Document {
 	cur, ok := resp.Lookup("cursor").DocumentOK()
 	if !ok {
 		return resp
@@ -925,6 +1221,32 @@ func (r *Rewriter) unprefixIndexes(resp bsoncore.Document) bsoncore.Document {
 	if !ok {
 		return resp
 	}
+	vals, err := batch.Values()
+	if err != nil {
+		return resp
+	}
+	kept := make([]value, 0, len(vals))
+	for _, v := range vals {
+		d, ok := v.DocumentOK()
+		if !ok {
+			continue
+		}
+		name, _ := d.Lookup("name").StringValueOK()
+		if i := strings.Index(name, indexTagMark); i >= 0 {
+			if name[i:] != indexTag(t) {
+				continue // another tenant's private index
+			}
+		} else if k, ok := d.Lookup("key").DocumentOK(); ok && name != "_id_" {
+			// Untagged indexes are shared; show only those the proxy could
+			// have created (tenant-prefixed keys). Anything else predates the
+			// proxy or was made out of band.
+			if e, err := k.IndexErr(0); err != nil || e.Key() != r.field {
+				continue
+			}
+		}
+		kept = append(kept, v)
+	}
+	batch = arrayOf(kept...)
 	nb, err := mapDocs(batch, func(spec doc) (doc, error) {
 		key, ok := spec.Lookup("key").DocumentOK()
 		if !ok {
@@ -969,13 +1291,25 @@ func (r *Rewriter) Denied(cmd string) bool { _, d := r.deny[cmd]; return d }
 // ScopeViewPipeline scopes a view definition's pipeline. inject is true when
 // the view reads a shared collection and false when it reads another of the
 // tenant's (already scoped) views.
-func (r *Rewriter) ScopeViewPipeline(t *Tenant, p bsoncore.Array, inject bool) (bsoncore.Array, error) {
+func (r *Rewriter) ScopeViewPipeline(t *Tenant, p bsoncore.Array, inject bool) (out bsoncore.Array, err error) {
+	defer func() {
+		if recover() != nil { // recover must be called by the deferred function itself
+			out, err = nil, errInternal()
+		}
+	}()
+	if err := validateDeep(p, 1); err != nil {
+		return nil, err
+	}
 	return r.scopePipeline(t, p, inject, nil)
 }
 
 // RewriteView rewrites a read against a tenant's view, which physically lives
 // in the collection `phys`.
-func (r *Rewriter) RewriteView(t *Tenant, db string, body bsoncore.Document, seqs []wire.Seq, phys string) (*Result, error) {
+func (r *Rewriter) RewriteView(t *Tenant, db string, body bsoncore.Document, seqs []wire.Seq, phys string) (res *Result, err error) {
+	defer recoverRewrite(&res, &err)
+	if err := validateCommand(body, seqs); err != nil {
+		return nil, err
+	}
 	elems, err := body.Elements()
 	if err != nil || len(elems) == 0 {
 		return nil, badValue("malformed command document")
@@ -1002,7 +1336,11 @@ func (r *Rewriter) RewriteView(t *Tenant, db string, body bsoncore.Document, seq
 	}
 	nb := finishDoc(out)
 	ne, _ := nb.Elements()
-	res, err := r.cmds[name](r, &request{t: t, db: db, cmd: name, body: nb, seqs: seqs, e: ne, noScope: true})
+	vq := &request{t: t, db: db, cmd: name, body: nb, seqs: seqs, e: ne, noScope: true}
+	if err := r.vet(vq); err != nil {
+		return nil, err
+	}
+	res, err = r.cmds[name](r, vq)
 	if err != nil {
 		return nil, err
 	}
@@ -1016,7 +1354,11 @@ func (r *Rewriter) isDBChangeStream(q *request) bool {
 	if n, ok := q.e[0].Value().AsInt64OK(); !ok || n != 1 {
 		return false
 	}
-	st, err := q.body.Lookup("pipeline").Array().Values()
+	pa, ok := q.body.Lookup("pipeline").ArrayOK()
+	if !ok {
+		return false
+	}
+	st, err := pa.Values()
 	if err != nil || len(st) == 0 {
 		return false
 	}

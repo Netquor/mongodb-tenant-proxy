@@ -108,6 +108,17 @@ func (r *Rewriter) rewriteWrite(t *Tenant, stage string, spec value, ex *extras)
 		}
 		on = append(on, f)
 	}
+	// `on: []` or `on: "tenantId"` would otherwise ask for a unique index on the
+	// tenant field alone, capping every tenant at one document in a collection
+	// they all share.
+	if len(on) < 2 {
+		return nil, badValue("$merge on must name at least one field other than %q", r.field)
+	}
+	for _, f := range on {
+		if f == "" || strings.HasPrefix(f, "$") || strings.Contains(f, "\x00") {
+			return nil, badValue("invalid $merge on field %q", f)
+		}
+	}
 	ex.before = append(ex.before, r.uniqueIndex(db, coll, on))
 
 	out := make([]byte, 4, 128)

@@ -239,7 +239,7 @@ func (d *Dialer) EnsureImagesDB(c *Conn, db string) error {
 	if err != nil {
 		return err
 	}
-	batch, _ := resp.Lookup("cursor", "firstBatch").ArrayOK()
+	batch, _ := wire.LookupPath(resp, "cursor", "firstBatch").ArrayOK()
 	vals, _ := batch.Values()
 	for _, v := range vals {
 		doc, _ := v.DocumentOK()
