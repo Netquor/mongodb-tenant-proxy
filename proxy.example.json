@@ -4,7 +4,13 @@
     "uri": "mongodb://proxy-user:CHANGE_ME@mongo.internal:27017/?authSource=admin&tls=true",
     "caFile": "/etc/ssl/mongo-ca.pem"
   },
-  "tenant": { "field": "tenantId", "idType": "string" },
+  "tenant": {
+    "field": "tenantId",
+    "idType": "string",
+    "idPolicy": "require-generated",
+    "limits": { "opsPerSec": 500, "maxOpenCursors": 100, "maxTimeMSCap": 60000, "defaultMaxTimeMS": 30000 },
+    "overrides": { "acme": { "opsPerSec": 5000 } }
+  },
   "databases": ["app"],
   "auth": {
     "mode": "scram",

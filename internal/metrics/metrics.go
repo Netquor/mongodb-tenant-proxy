@@ -32,6 +32,8 @@ type Registry struct {
 
 	mu       sync.Mutex
 	commands map[string]*Counter // "command|outcome"
+	quotas   map[string]*Counter // see quota.go
+	gauges   map[string]*Gauge
 }
 
 // New returns an empty registry.
@@ -71,6 +73,7 @@ func (r *Registry) write(w io.Writer) {
 		}
 		fmt.Fprintf(w, "mtp_commands_total{command=%q,outcome=%q} %d\n", name, outcome, r.commands[k].v.Load())
 	}
+	r.writeQuota(w)
 	r.mu.Unlock()
 }
 
