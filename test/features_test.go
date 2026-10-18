@@ -164,7 +164,13 @@ func TestJavaScriptAndMapReduce(t *testing.T) {
 			{Key: "reduce", Value: bson.JavaScript("function(k,v){ return 1; }")},
 			{Key: "out", Value: "somewhere"},
 		}).Err()
-		mustFail(t, err, "mapReduce to a collection")
+		must(t, err) // collection output is supported (see TestMapReduceOut)
+		mustFail(t, a.Database("js").RunCommand(ctx(t), bson.D{
+			{Key: "mapReduce", Value: "c"},
+			{Key: "map", Value: bson.JavaScript("function(){ emit(1,1); }")},
+			{Key: "reduce", Value: bson.JavaScript("function(k,v){ return 1; }")},
+			{Key: "out", Value: bson.M{"replace": "system.profile"}},
+		}).Err(), "mapReduce to a system collection")
 	})
 }
 
@@ -299,6 +305,6 @@ func TestViews(t *testing.T) {
 		if n := count(t, db.Collection("totals"), bson.M{}); n != 1 {
 			t.Fatalf("B's view was affected by A's drop (%d)", n)
 		}
-		mustFail(t, da.RunCommand(ctx(t), bson.D{{Key: "collMod", Value: "items"}, {Key: "validator", Value: bson.M{}}}).Err(), "collMod on a collection")
+		mustFail(t, da.RunCommand(ctx(t), bson.D{{Key: "collMod", Value: "items"}, {Key: "expireAfterSeconds", Value: 1}}).Err(), "collMod on a collection")
 	})
 }

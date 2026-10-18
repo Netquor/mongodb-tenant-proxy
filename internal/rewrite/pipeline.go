@@ -93,6 +93,21 @@ func (r *Rewriter) scopePipeline(t *Tenant, p arr, inject bool, ex *extras) (arr
 			}
 			out = append(out, w...)
 			continue
+		case "$search", "$searchMeta", "$vectorSearch":
+			if !inject || i != 0 {
+				return nil, deny("%s must be the first stage of a collection aggregate", name)
+			}
+			ns, err := r.rewriteSearch(t, name, spec)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, docValue(buildDoc(valElem(name, ns))))
+			if name != "$searchMeta" && !returnsStoredSource(spec) {
+				// Defence in depth: the search itself is already filtered.
+				out = append(out, docValue(buildDoc(bsoncore.AppendDocumentElement(nil, "$match", r.tenantDoc(t)))))
+			}
+			scopedFirst = true
+			continue
 		case "$lookup":
 			ns, err = r.rewriteLookup(t, spec)
 		case "$graphLookup":
