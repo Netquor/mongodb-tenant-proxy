@@ -52,13 +52,20 @@ type Manager struct {
 	Log        *slog.Logger
 	MaxMessage int
 
+	// idleGrace is how long an unwatched hub keeps its stream (tests shorten it).
+	idleGrace time.Duration
+
+	// Lock order (outer -> inner): Manager.mu -> hub.mu -> Sub.mu.
+	// No path takes them in any other order: Subscribe releases Manager.mu
+	// before hub.add; Sub methods release Sub.mu before calling into the hub;
+	// hub.run releases hub.mu before taking Manager.mu.
 	mu   sync.Mutex
 	hubs map[string]*hub
 }
 
 // NewManager creates a Manager.
 func NewManager(d *upstream.Dialer, field string, autoImages bool, maxMessage int, log *slog.Logger) *Manager {
-	return &Manager{Dial: d, Field: field, AutoImages: autoImages, MaxMessage: maxMessage, Log: log, hubs: map[string]*hub{}}
+	return &Manager{Dial: d, Field: field, AutoImages: autoImages, MaxMessage: maxMessage, Log: log, hubs: map[string]*hub{}, idleGrace: hubIdleGrace}
 }
 
 // ActiveHubs reports the number of upstream streams currently open.
@@ -165,7 +172,7 @@ func (h *hub) remove(s *Sub) {
 		h.n--
 	}
 	if h.n == 0 && !h.closed && h.idle == nil {
-		h.idle = time.AfterFunc(hubIdleGrace, h.shutdownIfIdle)
+		h.idle = time.AfterFunc(h.m.idleGrace, h.shutdownIfIdle)
 	}
 }
 
@@ -240,6 +247,7 @@ func (h *hub) run(first Timestamp) {
 			delete(h.m.hubs, h.db+"."+h.coll)
 			h.m.mu.Unlock()
 			h.failAll(err)
+			h.cancel() // release the hub context; nothing else will
 			return
 		}
 		var fatal *fatalError
@@ -275,8 +283,13 @@ func (h *hub) stream(first Timestamp, token *bsoncore.Document, ready func(error
 	if err != nil {
 		return err
 	}
+	// sctx ends with this stream (not only with the hub): otherwise every
+	// resume after a failover would leave one more goroutine parked on h.ctx
+	// until the hub itself shut down.
+	sctx, scancel := context.WithCancel(h.ctx)
+	defer scancel()
 	defer c.Close()
-	go func() { <-h.ctx.Done(); c.Close() }()
+	go func() { <-sctx.Done(); c.Close() }()
 
 	mode := "required"
 	if h.coll == "" {

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
@@ -37,7 +38,14 @@ type viewSet struct {
 	m  map[string]*viewDef
 }
 
-type viewCache struct{ m sync.Map } // db + "\x00" + tenant -> *viewSet
+type viewCache struct {
+	m sync.Map // db + "\x00" + tenant -> *viewSet
+	// gen counts invalidations. A loader that started before an invalidation
+	// must not publish its (possibly pre-DDL) result afterwards, or the
+	// connection that just created/dropped a view would keep reading the stale
+	// set for viewTTL.
+	gen atomic.Uint64
+}
 
 func physName(tenant, name string) string {
 	h := sha256.Sum256([]byte(tenant))
@@ -48,7 +56,10 @@ func viewDocID(tenant, name string) string { return physName(tenant, name) }
 
 func (c *conn) cacheKey(db string) string { return db + "\x00" + c.tenant.ID }
 
-func (c *conn) invalidateViews(db string) { c.s.views.m.Delete(c.cacheKey(db)) }
+func (c *conn) invalidateViews(db string) {
+	c.s.views.gen.Add(1)
+	c.s.views.m.Delete(c.cacheKey(db))
+}
 
 // views returns the tenant's views in db (cached for a few seconds).
 func (c *conn) viewsIn(db string) (map[string]*viewDef, error) {
@@ -57,6 +68,7 @@ func (c *conn) viewsIn(db string) (map[string]*viewDef, error) {
 			return vs.m, nil
 		}
 	}
+	gen := c.s.views.gen.Load() // before reading upstream; see viewCache.gen
 	if err := c.ensureUp(); err != nil {
 		return nil, err
 	}
@@ -87,7 +99,9 @@ func (c *conn) viewsIn(db string) (map[string]*viewDef, error) {
 			}
 		}
 	}
-	c.s.views.m.Store(c.cacheKey(db), &viewSet{at: time.Now(), m: out})
+	if c.s.views.gen.Load() == gen {
+		c.s.views.m.Store(c.cacheKey(db), &viewSet{at: time.Now(), m: out})
+	}
 	return out, nil
 }
 
