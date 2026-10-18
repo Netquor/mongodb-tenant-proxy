@@ -4,6 +4,7 @@ package admin
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
@@ -101,12 +102,25 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	if s.tlsc != nil {
 		ln = tls.NewListener(ln, s.tlsc)
 	}
-	hs := &http.Server{Handler: s.Handler(), ReadHeaderTimeout: 10 * time.Second}
-	go func() {
-		<-ctx.Done()
+	hs := &http.Server{
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second, // bodies are capped at 1 MiB; bound slow senders too
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
+	done := make(chan struct{})
+	defer close(done) // releases the shutdown goroutine when Serve fails on its own
+	go func() {       // #nosec G118 -- ctx is already cancelled when shutdown runs; it needs a fresh bounded context
+		select {
+		case <-ctx.Done():
+		case <-done:
+			return
+		}
 		sc, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		hs.Shutdown(sc)
+		_ = hs.Shutdown(sc)
 	}()
 	if err := hs.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -126,11 +140,17 @@ func (s *Server) authenticate(r *http.Request) (string, bool) {
 	}
 	if s.token != nil {
 		h := r.Header.Get("Authorization")
-		if t, ok := strings.CutPrefix(h, "Bearer "); ok && subtle.ConstantTimeCompare([]byte(t), s.token) == 1 {
+		// Compare fixed-length digests so neither content nor length of the token leaks through timing.
+		if t, ok := strings.CutPrefix(h, "Bearer "); ok && tokenEqual(t, s.token) {
 			return "token", true
 		}
 	}
 	return "", false
+}
+
+func tokenEqual(got string, want []byte) bool {
+	g, w := sha256.Sum256([]byte(got)), sha256.Sum256(want)
+	return subtle.ConstantTimeCompare(g[:], w[:]) == 1
 }
 
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -145,6 +165,13 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		s.b.Audit().Log(audit.Event{Type: audit.AdminAction, Corr: id, Remote: r.RemoteAddr, Action: r.Method + " " + r.URL.Path, Outcome: "unauthorized"})
 		w.Header().Set("WWW-Authenticate", `Bearer realm="mongodb-tenant-proxy"`)
 		writeJSON(w, 401, map[string]string{"error": "unauthorized"})
+		return
+	}
+	// CSRF: bearer tokens are not ambient credentials, but an mTLS client
+	// certificate is presented by a browser automatically. Browsers always send
+	// Origin on cross-origin state-changing requests; API clients never do.
+	if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Header.Get("Origin") != "" {
+		writeJSON(w, 403, map[string]string{"error": "cross-origin requests are not allowed"})
 		return
 	}
 	r = r.WithContext(context.WithValue(r.Context(), reqKey, &reqInfo{actor: actor, id: id}))
@@ -178,7 +205,7 @@ func (s *Server) routes() {
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v) // the status line is already sent; a broken client connection is not actionable
 }
 
 func fail(w http.ResponseWriter, err error) {

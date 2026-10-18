@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"io"
 
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
@@ -275,10 +276,10 @@ func readHeader(r io.Reader) (wire.Header, error) {
 		return wire.Header{}, err
 	}
 	h := wire.Header{
-		Length:     int32(binary.LittleEndian.Uint32(b[0:])),
-		RequestID:  int32(binary.LittleEndian.Uint32(b[4:])),
-		ResponseTo: int32(binary.LittleEndian.Uint32(b[8:])),
-		OpCode:     int32(binary.LittleEndian.Uint32(b[12:])),
+		Length:     safeconv.I32(binary.LittleEndian.Uint32(b[0:])),
+		RequestID:  safeconv.I32(binary.LittleEndian.Uint32(b[4:])),
+		ResponseTo: safeconv.I32(binary.LittleEndian.Uint32(b[8:])),
+		OpCode:     safeconv.I32(binary.LittleEndian.Uint32(b[12:])),
 	}
 	if h.Length < 21 {
 		return h, fmt.Errorf("wire: invalid message length %d", h.Length)

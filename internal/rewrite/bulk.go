@@ -108,9 +108,7 @@ func (r *Rewriter) cmdBulkWrite(q *request) (*Result, error) {
 
 func toDocs(ds []doc) []bsoncore.Document {
 	out := make([]bsoncore.Document, len(ds))
-	for i, d := range ds {
-		out[i] = d
-	}
+	copy(out, ds)
 	return out
 }
 

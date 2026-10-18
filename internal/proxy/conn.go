@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"io"
 	"log/slog"
 	"net"
@@ -99,7 +100,7 @@ func (c *conn) serve(ctx context.Context) {
 	}
 	for {
 		if idle := s.rt().idle; idle > 0 {
-			c.nc.SetReadDeadline(time.Now().Add(idle))
+			_ = c.nc.SetReadDeadline(time.Now().Add(idle)) // failure surfaces as the next read error
 		}
 		h, body, err := wire.ReadFrame(c.br, s.rt().maxMessage)
 		if err != nil {
@@ -164,7 +165,7 @@ func (c *conn) decompress(h wire.Header, body []byte) (wire.Header, []byte, erro
 		return h, nil, err
 	}
 	c.reqComp = id
-	h.OpCode, h.Length = op, int32(len(data)+16)
+	h.OpCode, h.Length = op, safeconv.Sat32(len(data)+16)
 	return h, data, nil
 }
 

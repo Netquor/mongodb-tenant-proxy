@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"io"
 	"strings"
 	"sync"
@@ -93,8 +94,8 @@ func CompressorID(body []byte) (Compressor, bool) {
 // an OP_COMPRESSED body.
 func Compress(id Compressor, opcode int32, data []byte) ([]byte, error) {
 	out := make([]byte, compressedHeader, compressedHeader+len(data)/2+32)
-	binary.LittleEndian.PutUint32(out[0:], uint32(opcode))
-	binary.LittleEndian.PutUint32(out[4:], uint32(len(data)))
+	binary.LittleEndian.PutUint32(out[0:], safeconv.U32(opcode))
+	binary.LittleEndian.PutUint32(out[4:], safeconv.Len32(len(data)))
 	out[8] = byte(id)
 	switch id {
 	case CompNone:
@@ -134,8 +135,8 @@ func Decompress(body []byte, maxSize int) (opcode int32, id Compressor, data []b
 	if len(body) < compressedHeader {
 		return 0, 0, nil, ErrBadCompressed
 	}
-	opcode = int32(binary.LittleEndian.Uint32(body[0:]))
-	size := int(int32(binary.LittleEndian.Uint32(body[4:])))
+	opcode = safeconv.I32(binary.LittleEndian.Uint32(body[0:]))
+	size := int(safeconv.I32(binary.LittleEndian.Uint32(body[4:])))
 	id = Compressor(body[8])
 	src := body[compressedHeader:]
 	if opcode == OpCompressed {

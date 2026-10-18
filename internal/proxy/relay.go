@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"io"
 	"math"
 
@@ -71,7 +72,7 @@ func (w *walker) u32() (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return int64(int32(binary.LittleEndian.Uint32(b))), nil
+	return int64(safeconv.I32(binary.LittleEndian.Uint32(b))), nil
 }
 
 // cstring forwards a NUL-terminated string and returns it (keys are short).
@@ -199,9 +200,9 @@ func (w *walker) number(t byte) (float64, bool, error) {
 	case 0x01:
 		return math.Float64frombits(binary.LittleEndian.Uint64(b)), true, nil
 	case 0x10:
-		return float64(int32(binary.LittleEndian.Uint32(b))), true, nil
+		return float64(safeconv.I32(binary.LittleEndian.Uint32(b))), true, nil
 	}
-	return float64(int64(binary.LittleEndian.Uint64(b))), true, nil
+	return float64(safeconv.I64(binary.LittleEndian.Uint64(b))), true, nil
 }
 
 // relayStream forwards the rest of a reply whose 16-byte header has been read
@@ -209,10 +210,10 @@ func (w *walker) number(t byte) (float64, bool, error) {
 func relayStream(up *bufio.Reader, out *bufio.Writer, hdr wire.Header, responseTo int32) (replyMeta, error) {
 	var meta replyMeta
 	var h [16]byte
-	binary.LittleEndian.PutUint32(h[0:], uint32(hdr.Length))
-	binary.LittleEndian.PutUint32(h[4:], uint32(hdr.RequestID))
-	binary.LittleEndian.PutUint32(h[8:], uint32(responseTo))
-	binary.LittleEndian.PutUint32(h[12:], uint32(hdr.OpCode))
+	binary.LittleEndian.PutUint32(h[0:], safeconv.U32(hdr.Length))
+	binary.LittleEndian.PutUint32(h[4:], safeconv.U32(hdr.RequestID))
+	binary.LittleEndian.PutUint32(h[8:], safeconv.U32(responseTo))
+	binary.LittleEndian.PutUint32(h[12:], safeconv.U32(hdr.OpCode))
 	if _, err := out.Write(h[:]); err != nil {
 		return meta, err
 	}
@@ -244,7 +245,7 @@ func relayStream(up *bufio.Reader, out *bufio.Writer, hdr wire.Header, responseT
 					case k == "id" && t == 0x12:
 						b, err := w.read(8)
 						if err == nil {
-							meta.cursorID = int64(binary.LittleEndian.Uint64(b))
+							meta.cursorID = safeconv.I64(binary.LittleEndian.Uint64(b))
 						}
 						return true, err
 					case k == "ns" && t == 0x02:

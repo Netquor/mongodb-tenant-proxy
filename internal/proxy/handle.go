@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
@@ -291,7 +292,7 @@ func (c *conn) handleKillCursors(h wire.Header, m *wire.Msg, db string) error {
 	}
 	nb = append(nb, 0)
 	n := len(nb)
-	nb[0], nb[1], nb[2], nb[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	safeconv.PutLen(nb, n)
 	for _, id := range ownedIDs {
 		if phys, isView := c.viewPhys[id]; isView {
 			nb = withString(nb, "killCursors", phys)
@@ -335,14 +336,14 @@ func (c *conn) helloDoc(legacy bool) bsoncore.Document {
 	b = bsoncore.AppendInt32Element(b, "maxWriteBatchSize", l.maxBatch)
 	b = bsoncore.AppendDateTimeElement(b, "localTime", time.Now().UnixMilli())
 	b = bsoncore.AppendInt32Element(b, "logicalSessionTimeoutMinutes", l.sessionTimeout)
-	b = bsoncore.AppendInt32Element(b, "connectionId", int32(c.id))
+	b = bsoncore.AppendInt32Element(b, "connectionId", safeconv.Sat32(c.id))
 	b = bsoncore.AppendInt32Element(b, "minWireVersion", l.minWire)
 	b = bsoncore.AppendInt32Element(b, "maxWireVersion", l.maxWire)
 	b = bsoncore.AppendBooleanElement(b, "readOnly", false)
 	b = bsoncore.AppendInt32Element(b, "ok", 1)
 	b = append(b, 0)
 	n := len(b)
-	b[0], b[1], b[2], b[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	safeconv.PutLen(b, n)
 	return b
 }
 
@@ -411,7 +412,7 @@ func insertBeforeOK(d bsoncore.Document, elem []byte) bsoncore.Document {
 	out = append(out, elem...)
 	out = append(out, 0)
 	n := len(out)
-	out[0], out[1], out[2], out[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	safeconv.PutLen(out, n)
 	return out
 }
 

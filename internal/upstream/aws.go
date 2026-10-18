@@ -35,7 +35,12 @@ func (d *Dialer) awsCredentials() (awsCreds, error) {
 		c = awsCreds{os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY"), os.Getenv("AWS_SESSION_TOKEN")}
 	}
 	if c.AccessKeyID == "" {
+		// The relative URI must be a plain path: anything else ("@host", "//host")
+		// would repoint the fetch away from the fixed link-local ECS endpoint.
 		if rel := os.Getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"); rel != "" {
+			if !strings.HasPrefix(rel, "/") || strings.HasPrefix(rel, "//") || strings.ContainsAny(rel, "@\\ \t\r\n") {
+				return awsCreds{}, errors.New("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI must be an absolute path")
+			}
 			return fetchECSCreds("http://169.254.170.2" + rel)
 		}
 	}
@@ -47,6 +52,7 @@ func (d *Dialer) awsCredentials() (awsCreds, error) {
 
 func fetchECSCreds(url string) (awsCreds, error) {
 	cl := http.Client{Timeout: 5 * time.Second}
+	// #nosec G704 -- host is the fixed ECS link-local endpoint; the path was validated by the caller
 	resp, err := cl.Get(url)
 	if err != nil {
 		return awsCreds{}, err

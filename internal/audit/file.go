@@ -45,7 +45,7 @@ func (r *RotatingFile) open() error {
 	}
 	st, err := f.Stat()
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	r.f, r.size = f, st.Size()
@@ -53,15 +53,18 @@ func (r *RotatingFile) open() error {
 }
 
 func (r *RotatingFile) rotate() error {
-	r.f.Close()
+	_ = r.f.Close()
+	// Rotation is best effort: a missing backup is normal, and if a rename
+	// fails the next open still appends to (or recreates) the live file, so
+	// no event is lost; only the retention window shrinks.
 	if r.maxBackups > 0 {
-		os.Remove(fmt.Sprintf("%s.%d", r.path, r.maxBackups))
+		_ = os.Remove(fmt.Sprintf("%s.%d", r.path, r.maxBackups))
 		for i := r.maxBackups - 1; i >= 1; i-- {
-			os.Rename(fmt.Sprintf("%s.%d", r.path, i), fmt.Sprintf("%s.%d", r.path, i+1))
+			_ = os.Rename(fmt.Sprintf("%s.%d", r.path, i), fmt.Sprintf("%s.%d", r.path, i+1))
 		}
-		os.Rename(r.path, r.path+".1")
+		_ = os.Rename(r.path, r.path+".1")
 	} else {
-		os.Remove(r.path)
+		_ = os.Remove(r.path)
 	}
 	return r.open()
 }

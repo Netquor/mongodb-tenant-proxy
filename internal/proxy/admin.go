@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"strings"
 	"time"
 
@@ -78,7 +79,7 @@ func respErr(resp bsoncore.Document) error {
 	code, _ := resp.Lookup("code").AsInt64OK()
 	name, _ := resp.Lookup("codeName").StringValueOK()
 	msg, _ := resp.Lookup("errmsg").StringValueOK()
-	return &rewrite.Error{Code: int32(code), CodeName: name, Msg: msg}
+	return &rewrite.Error{Code: safeconv.Sat32(code), CodeName: name, Msg: msg}
 }
 
 func (u connUp) OwnClients() []string { return u.c.s.ownClients(u.c.tenant.ID) }

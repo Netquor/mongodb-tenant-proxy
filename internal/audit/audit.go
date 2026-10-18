@@ -69,7 +69,6 @@ type Logger struct {
 	mu     sync.Mutex
 	sample atomic.Uint64 // math.Float64bits of the read sampling rate
 	rng    atomic.Uint64
-	seq    atomic.Uint64
 }
 
 // New builds a Logger from config; it returns nil (no-op) when disabled.
@@ -167,7 +166,7 @@ func (l *Logger) Log(e Event) {
 	}
 	b = append(b, '\n')
 	l.mu.Lock()
-	l.sink.Write(b)
+	_, _ = l.sink.Write(b) // an unwritable audit sink must never fail the request being audited
 	l.mu.Unlock()
 }
 

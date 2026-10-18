@@ -1,6 +1,7 @@
 package rewrite
 
 import (
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -318,7 +319,7 @@ func setOnInsertID(d doc, id value) (value, error) {
 		b = bsoncore.AppendValueElement(b, "_id", id)
 		b = append(b, 0)
 		n := len(b)
-		b[0], b[1], b[2], b[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+		safeconv.PutLen(b, n)
 		return docValue(b), true, nil
 	})
 	return docValue(out), err

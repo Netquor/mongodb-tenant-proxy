@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"io"
 	"log/slog"
 	"net"
@@ -106,7 +107,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	}
 	get := func(k string, def int32) int32 {
 		if v, ok := h.Lookup(k).AsInt64OK(); ok && v > 0 {
-			return int32(v)
+			return safeconv.Sat32(v)
 		}
 		return def
 	}

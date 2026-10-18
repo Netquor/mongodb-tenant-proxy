@@ -1,0 +1,6 @@
+# Used by `trivy config` (CI and `make security`).
+misconfiguration:
+  scanners:
+    - dockerfile
+    - helm
+    - kubernetes

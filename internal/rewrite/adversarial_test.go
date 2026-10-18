@@ -57,8 +57,6 @@ type advCase struct {
 	reject bool
 	// errHas, when set, must appear in the rejection message.
 	errHas string
-	// cfg overrides the rewriter configuration (default: change streams on).
-	cfg *Config
 }
 
 func seqOf(id string, docs ...any) wire.Seq {
@@ -75,15 +73,11 @@ func seqOf(id string, docs ...any) wire.Seq {
 
 func withDB(d D) D { return append(d, s1("$db", "app")) }
 
-func pl(stages ...any) A { return A(stages) }
-
 func agg(stages ...any) D {
 	return withDB(D{s1("aggregate", "c"), s1("pipeline", A(stages)), s1("cursor", M{})})
 }
 
 func upd(stmts ...any) D { return withDB(D{s1("update", "c"), s1("updates", A(stmts))}) }
-
-func collation(m M) M { return m }
 
 func adversarialCases() []advCase {
 	deepFilter := nested("$and", 150, rawStr("a", "b"))

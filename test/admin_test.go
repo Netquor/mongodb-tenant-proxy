@@ -546,7 +546,7 @@ func TestBulkWriteCommand(t *testing.T) {
 		{Database: "bw", Collection: "vw", Model: mongo.NewClientInsertOneModel().SetDocument(bson.M{"x": 1})}})
 	mustFail(t, err, "write to a view")
 	// Unordered continues past errors.
-	res, err = a.BulkWrite(ctx(t), []mongo.ClientBulkWrite{
+	_, err = a.BulkWrite(ctx(t), []mongo.ClientBulkWrite{
 		{Database: "bw", Collection: "c3", Model: mongo.NewClientInsertOneModel().SetDocument(bson.M{"_id": 1})},
 		{Database: "bw", Collection: "c3", Model: mongo.NewClientInsertOneModel().SetDocument(bson.M{"_id": 1})},
 		{Database: "bw", Collection: "c3", Model: mongo.NewClientInsertOneModel().SetDocument(bson.M{"_id": 2})},
