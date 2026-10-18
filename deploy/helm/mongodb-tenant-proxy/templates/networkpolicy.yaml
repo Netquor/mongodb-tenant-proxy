@@ -1,0 +1,35 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "mtp.fullname" . }}
+  labels: {{- include "mtp.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "mtp.selector" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: {{- toYaml .Values.networkPolicy.clientFrom | nindent 8 }}
+      ports:
+        - { port: {{ include "mtp.port" .Values.config.listen }}, protocol: TCP }
+    {{- if .Values.networkPolicy.metricsFrom }}
+    - from: {{- toYaml .Values.networkPolicy.metricsFrom | nindent 8 }}
+      ports:
+        - { port: {{ include "mtp.port" .Values.config.metricsAddr }}, protocol: TCP }
+    {{- end }}
+    {{- if and .Values.networkPolicy.adminFrom .Values.config.adminAddr }}
+    - from: {{- toYaml .Values.networkPolicy.adminFrom | nindent 8 }}
+      ports:
+        - { port: {{ include "mtp.port" .Values.config.adminAddr }}, protocol: TCP }
+    {{- end }}
+  egress:
+    - ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+    - {{- if .Values.networkPolicy.mongoCIDR }}
+      to:
+        - ipBlock: { cidr: {{ .Values.networkPolicy.mongoCIDR | quote }} }
+      {{- end }}
+      ports:
+        - { port: 27017, protocol: TCP }
+{{- end }}

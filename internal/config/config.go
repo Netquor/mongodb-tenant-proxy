@@ -34,6 +34,19 @@ type Config struct {
 	// ChangeStreams controls collection-level change streams.
 	ChangeStreams ChangeStreams `json:"changeStreams,omitempty"`
 
+	// Tenants declares tenants explicitly (optional).
+	Tenants []TenantEntry `json:"tenants,omitempty"`
+	// AdminAddr enables the admin API listener (e.g. "127.0.0.1:9103").
+	AdminAddr string         `json:"adminAddr,omitempty"`
+	Admin     Admin          `json:"admin,omitempty"`
+	Store     Store          `json:"store,omitempty"`
+	Metrics   MetricsOptions `json:"metrics,omitempty"`
+	Audit     Audit          `json:"audit,omitempty"`
+	Tracing   Tracing        `json:"tracing,omitempty"`
+
+	// Path is the file the config was loaded from (set by Load; used by reload).
+	Path string `json:"-"`
+
 	MaxMessageBytes   int    `json:"maxMessageBytes,omitempty"`
 	MaxConnsPerTenant int    `json:"maxConnsPerTenant,omitempty"`
 	IdleTimeout       string `json:"idleTimeout,omitempty"`
@@ -111,7 +124,7 @@ type User struct {
 // Load reads a config file (if path is non-empty), applies environment
 // overrides and defaults, and validates the result.
 func Load(path string) (*Config, error) {
-	c := &Config{}
+	c := &Config{Path: path}
 	if path != "" {
 		b, err := os.ReadFile(path)
 		if err != nil {
@@ -175,8 +188,9 @@ func (c *Config) finish() error {
 	}
 	switch c.Auth.Mode {
 	case "scram":
-		if len(c.Auth.Users) == 0 {
-			return fmt.Errorf("auth.mode=scram requires auth.users")
+		// Users may also come from the dynamic store (admin API).
+		if len(c.Auth.Users) == 0 && c.AdminAddr == "" && len(c.Tenants) == 0 && c.Store.Type == "" {
+			return fmt.Errorf("auth.mode=scram requires auth.users (or adminAddr/store for dynamic users)")
 		}
 	case "appname":
 	case "static":
@@ -193,7 +207,7 @@ func (c *Config) finish() error {
 			}
 		}
 	}
-	return nil
+	return c.finishOps()
 }
 
 // IdleDuration returns the parsed idle timeout (0 = none).

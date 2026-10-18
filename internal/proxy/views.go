@@ -101,7 +101,7 @@ var viewWriteCmds = map[string]bool{"insert": true, "update": true, "delete": tr
 // create, drop or modify one). handled is false when the command is not
 // view-related and should take the normal path.
 func (c *conn) maybeView(h wire.Header, m *wire.Msg, name, db string) (handled bool, err error) {
-	if c.s.cfg.DisableViews {
+	if c.s.rt().disableViews {
 		return false, nil
 	}
 	switch {
@@ -116,7 +116,7 @@ func (c *conn) maybeView(h wire.Header, m *wire.Msg, name, db string) (handled b
 	if name == "collMod" || (name == "create" && m.Body.Lookup("viewOn").Type != 0) {
 		return true, c.viewDDL(h, m, name, db, coll)
 	}
-	if !c.s.rw.AllowedDB(db) || c.s.rw.Denied(name) {
+	if !c.s.rt().rw.AllowedDB(db) || c.s.rt().rw.Denied(name) {
 		return false, nil // let the normal path produce the right error
 	}
 	views, verr := c.viewsIn(db)
@@ -133,9 +133,9 @@ func (c *conn) maybeView(h wire.Header, m *wire.Msg, name, db string) (handled b
 	case name == "drop":
 		return true, c.dropView(h, db, def)
 	case viewReadCmds[name]:
-		res, err := c.s.rw.RewriteView(c.tenant, db, m.Body, m.Seqs, def.Phys)
+		res, err := c.s.rt().rw.RewriteView(c.tenant, db, m.Body, m.Seqs, def.Phys)
 		if err != nil {
-			c.s.M.Command(name, "denied")
+			c.cmdDeny(name, err.Error())
 			return true, c.reply(h, toErrorDoc(err))
 		}
 		res.Alias, res.Phys = coll, def.Phys
@@ -160,7 +160,7 @@ func failed(resp bsoncore.Document) bool {
 // viewDDL handles create (with viewOn) and collMod on a view.
 func (c *conn) viewDDL(h wire.Header, m *wire.Msg, name, db, coll string) error {
 	fail := func(err error) error { return c.reply(h, toErrorDoc(err)) }
-	if !c.s.rw.AllowedDB(db) || c.s.rw.Denied(name) {
+	if !c.s.rt().rw.AllowedDB(db) || c.s.rt().rw.Denied(name) {
 		return c.reply(h, errorDoc(13, "Unauthorized", "tenant proxy: command not allowed"))
 	}
 	if err := rewrite.CheckCollName(coll); err != nil {
@@ -205,7 +205,7 @@ func (c *conn) viewDDL(h wire.Header, m *wire.Msg, name, db, coll string) error 
 	} else if err := rewrite.CheckCollName(viewOn); err != nil {
 		return fail(err)
 	}
-	scoped, err := c.s.rw.ScopeViewPipeline(c.tenant, pipeline, inject)
+	scoped, err := c.s.rt().rw.ScopeViewPipeline(c.tenant, pipeline, inject)
 	if err != nil {
 		return fail(err)
 	}
@@ -266,7 +266,7 @@ func (c *conn) viewDDL(h wire.Header, m *wire.Msg, name, db, coll string) error 
 		return c.relay(h, resp, err)
 	}
 	c.invalidateViews(db)
-	c.s.M.Command(name, "ok")
+	c.cmdDone(name, "ok")
 	return c.reply(h, okDoc())
 }
 
@@ -283,7 +283,7 @@ func (c *conn) dropView(h wire.Header, db string, def *viewDef) error {
 		return c.relay(h, resp, err)
 	}
 	c.invalidateViews(db)
-	c.s.M.Command("drop", "ok")
+	c.cmdDone("drop", "ok")
 	return c.reply(h, bsoncore.BuildDocument(nil,
 		bsoncore.AppendStringElement(nil, "ns", db+"."+def.Name),
 		bsoncore.AppendInt32Element(nil, "ok", 1)))
@@ -375,7 +375,7 @@ func (c *conn) noteViewCursor(resp bsoncore.Document, phys string, getMoreID int
 // hookListCollections hides internal collections and lists the tenant's views.
 func (c *conn) hookListCollections(res *rewrite.Result, body bsoncore.Document, db string) {
 	var views map[string]*viewDef
-	if !c.s.cfg.DisableViews {
+	if !c.s.rt().disableViews {
 		views, _ = c.viewsIn(db)
 	}
 	nameOnly, _ := body.Lookup("nameOnly").BooleanOK()

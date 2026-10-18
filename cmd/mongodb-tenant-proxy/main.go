@@ -14,14 +14,25 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/netquor/mongodb-tenant-proxy/internal/admin"
 	"github.com/netquor/mongodb-tenant-proxy/internal/auth"
 	"github.com/netquor/mongodb-tenant-proxy/internal/config"
 	"github.com/netquor/mongodb-tenant-proxy/internal/proxy"
 )
 
+// Set at build time: -ldflags "-X main.version=... -X main.commit=... -X main.date=...".
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 const usage = `usage:
   mongodb-tenant-proxy [serve] -config proxy.json [-listen :27018]
+  mongodb-tenant-proxy version
+  mongodb-tenant-proxy healthcheck [-config proxy.json | -url http://127.0.0.1:9102/healthz]
   mongodb-tenant-proxy hash-password -user NAME -tenant TENANT   (password read from $MTP_PASSWORD or stdin prompt)
   mongodb-tenant-proxy sign-appname -secret SECRET -tenant TENANT
 `
@@ -36,6 +47,10 @@ func main() {
 	switch cmd {
 	case "serve":
 		err = serve(args)
+	case "version":
+		fmt.Printf("mongodb-tenant-proxy %s (commit %s, built %s)\n", version, commit, date)
+	case "healthcheck":
+		err = healthcheck(args)
 	case "hash-password":
 		err = hashPassword(args)
 	case "sign-appname":
@@ -63,16 +78,15 @@ func serve(args []string) error {
 	if *listen != "" {
 		cfg.Listen = *listen
 	}
-	level := slog.LevelInfo
-	if cfg.LogLevel == "debug" {
-		level = slog.LevelDebug
-	}
-	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	lv := new(slog.LevelVar)
+	lv.Set(cfg.SlogLevel())
+	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: lv}))
 
 	srv, err := proxy.New(cfg, log)
 	if err != nil {
 		return err
 	}
+	srv.OnReload(func(c *config.Config) { lv.Set(c.SlogLevel()) })
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return err
@@ -84,18 +98,94 @@ func serve(args []string) error {
 		}
 		ln = tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
 	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var hs []*http.Server
 	if cfg.MetricsAddr != "" {
+		hs = append(hs, &http.Server{Addr: cfg.MetricsAddr, Handler: srv.M.Handler(), ReadHeaderTimeout: 10 * time.Second})
+	}
+	if cfg.AdminAddr != "" {
+		adm, err := admin.New(srv, cfg.Admin)
+		if err != nil {
+			return err
+		}
+		aln, err := net.Listen("tcp", cfg.AdminAddr)
+		if err != nil {
+			return err
+		}
 		go func() {
-			if err := http.ListenAndServe(cfg.MetricsAddr, srv.M.Handler()); err != nil {
+			if err := adm.Serve(ctx, aln); err != nil {
+				log.Error("admin server", "err", err)
+			}
+		}()
+		log.Info("admin API listening", "addr", aln.Addr().String(), "tls", cfg.Admin.TLS != nil)
+	}
+	for _, h := range hs {
+		h := h
+		go func() {
+			if err := h.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				log.Error("metrics server", "err", err)
 			}
 		}()
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	log.Info("listening", "addr", ln.Addr().String(), "auth", cfg.Auth.Mode, "tenantField", cfg.Tenant.Field)
-	return srv.Serve(ctx, ln)
+	// SIGHUP reloads the config file; an invalid file leaves the old config running.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			if _, err := srv.Reload(); err != nil {
+				log.Error("config reload failed; keeping previous config", "err", err)
+			}
+		}
+	}()
+
+	log.Info("listening", "addr", ln.Addr().String(), "auth", cfg.Auth.Mode, "tenantField", cfg.Tenant.Field, "version", version)
+	err = srv.Serve(ctx, ln)
+	for _, h := range hs {
+		h.Close()
+	}
+	return err
+}
+
+func healthcheck(args []string) error {
+	fs := flag.NewFlagSet("healthcheck", flag.ExitOnError)
+	path := fs.String("config", "", "config file to read metricsAddr from")
+	u := fs.String("url", os.Getenv("MTP_HEALTH_URL"), "health URL")
+	fs.Parse(args)
+	if *u == "" {
+		addr := "127.0.0.1:9102"
+		if *path != "" {
+			cfg, err := config.Load(*path)
+			if err != nil {
+				return err
+			}
+			if cfg.MetricsAddr == "" {
+				return fmt.Errorf("metricsAddr is not set in %s", *path)
+			}
+			addr = cfg.MetricsAddr
+		}
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return err
+		}
+		if host == "" || host == "0.0.0.0" || host == "::" {
+			host = "127.0.0.1"
+		}
+		*u = "http://" + net.JoinHostPort(host, port) + "/healthz"
+	}
+	c := &http.Client{Timeout: 3 * time.Second}
+	resp, err := c.Get(*u)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("unhealthy: %s", resp.Status)
+	}
+	return nil
 }
 
 func hashPassword(args []string) error {
