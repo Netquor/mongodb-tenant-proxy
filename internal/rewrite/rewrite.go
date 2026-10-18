@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 
@@ -63,6 +64,9 @@ type Config struct {
 	// ChangeStreams permits collection-level change streams. They rely on
 	// collection pre/post images so events can be filtered by tenant.
 	ChangeStreams bool
+	// AtomicOut, when it returns true, makes $out swap the tenant's documents
+	// in a single transaction (needs a replica-set or sharded upstream).
+	AtomicOut func() bool
 }
 
 // Rewriter rewrites commands for a tenant. It is safe for concurrent use.
@@ -73,6 +77,9 @@ type Rewriter struct {
 	js    bool
 	cs    bool
 	cmds  map[string]cmdFn
+
+	started   time.Time
+	atomicOut func() bool
 }
 
 // New creates a Rewriter.
@@ -80,7 +87,7 @@ func New(cfg Config) *Rewriter {
 	if cfg.Field == "" {
 		cfg.Field = "tenantId"
 	}
-	r := &Rewriter{field: cfg.Field, js: cfg.AllowJS, cs: cfg.ChangeStreams, dbs: map[string]struct{}{}, deny: map[string]struct{}{}}
+	r := &Rewriter{field: cfg.Field, js: cfg.AllowJS, cs: cfg.ChangeStreams, started: time.Now(), atomicOut: cfg.AtomicOut, dbs: map[string]struct{}{}, deny: map[string]struct{}{}}
 	for _, d := range cfg.Databases {
 		r.dbs[d] = struct{}{}
 	}
@@ -88,23 +95,33 @@ func New(cfg Config) *Rewriter {
 		r.deny[c] = struct{}{}
 	}
 	r.cmds = map[string]cmdFn{
-		"find":            (*Rewriter).cmdFind,
-		"count":           (*Rewriter).cmdCount,
-		"distinct":        (*Rewriter).cmdCount,
-		"aggregate":       (*Rewriter).cmdAggregate,
-		"insert":          (*Rewriter).cmdInsert,
-		"update":          (*Rewriter).cmdUpdate,
-		"delete":          (*Rewriter).cmdDelete,
-		"findAndModify":   (*Rewriter).cmdFindAndModify,
-		"createIndexes":   (*Rewriter).cmdCreateIndexes,
-		"dropIndexes":     (*Rewriter).cmdDropIndexes,
-		"listIndexes":     (*Rewriter).cmdListIndexes,
-		"listCollections": (*Rewriter).cmdListCollections,
-		"create":          (*Rewriter).cmdCreate,
-		"drop":            (*Rewriter).cmdDrop,
-		"mapReduce":       (*Rewriter).cmdMapReduce,
-		"explain":         (*Rewriter).cmdExplain,
-		"listDatabases":   (*Rewriter).cmdListDatabases,
+		"find":             (*Rewriter).cmdFind,
+		"count":            (*Rewriter).cmdCount,
+		"distinct":         (*Rewriter).cmdCount,
+		"aggregate":        (*Rewriter).cmdAggregate,
+		"insert":           (*Rewriter).cmdInsert,
+		"update":           (*Rewriter).cmdUpdate,
+		"delete":           (*Rewriter).cmdDelete,
+		"findAndModify":    (*Rewriter).cmdFindAndModify,
+		"createIndexes":    (*Rewriter).cmdCreateIndexes,
+		"dropIndexes":      (*Rewriter).cmdDropIndexes,
+		"listIndexes":      (*Rewriter).cmdListIndexes,
+		"listCollections":  (*Rewriter).cmdListCollections,
+		"create":           (*Rewriter).cmdCreate,
+		"drop":             (*Rewriter).cmdDrop,
+		"mapReduce":        (*Rewriter).cmdMapReduce,
+		"explain":          (*Rewriter).cmdExplain,
+		"listDatabases":    (*Rewriter).cmdListDatabases,
+		"bulkWrite":        (*Rewriter).cmdBulkWrite,
+		"dropDatabase":     (*Rewriter).cmdDropDatabase,
+		"renameCollection": (*Rewriter).cmdRenameCollection,
+		"collMod":          (*Rewriter).cmdCollMod,
+		"dbStats":          (*Rewriter).cmdDbStats,
+		"collStats":        (*Rewriter).cmdCollStats,
+		"validate":         (*Rewriter).cmdValidate,
+		"currentOp":        (*Rewriter).cmdCurrentOp,
+		"killOp":           (*Rewriter).cmdKillOp,
+		"serverStatus":     (*Rewriter).cmdServerStatus,
 
 		// Session / transaction plumbing: carries no collection data.
 		"commitTransaction": passAdmin,
@@ -152,6 +169,12 @@ type Result struct {
 	// Reply, when non-nil, is sent to the client without contacting the
 	// upstream server.
 	Reply bsoncore.Document
+	// Run, when non-nil, produces the reply by running several commands
+	// itself; Body is not sent.
+	Run func(Upstream) (bsoncore.Document, error)
+	// Namespaces lists the "db.coll" namespaces a cross-namespace command
+	// (bulkWrite) touches, so the proxy can refuse writes to views.
+	Namespaces []string
 	// Post, when non-nil, transforms the upstream reply before it is sent.
 	Post func(bsoncore.Document) bsoncore.Document
 }
@@ -200,7 +223,7 @@ func (r *Rewriter) Rewrite(t *Tenant, db string, body bsoncore.Document, seqs []
 	if !ok {
 		return nil, deny("command %q is not allowed through the tenant proxy", name)
 	}
-	if !r.adminCmd(name) && !r.dbAllowed(db) {
+	if !r.adminCmd(name) && !r.dbAllowed(db) && !(name == "aggregate" && db == "admin" && r.isCurrentOpAggregate(body)) {
 		return nil, deny("database %q is not accessible", db)
 	}
 	q := &request{t: t, db: db, cmd: name, body: body, seqs: seqs, e: elems}
@@ -216,7 +239,8 @@ func (r *Rewriter) Rewrite(t *Tenant, db string, body bsoncore.Document, seqs []
 func (r *Rewriter) adminCmd(name string) bool {
 	switch name {
 	case "commitTransaction", "abortTransaction", "endSessions", "refreshSessions",
-		"startSession", "buildInfo", "whatsmyuri", "ping", "logout", "connectionStatus", "listDatabases":
+		"startSession", "buildInfo", "whatsmyuri", "ping", "logout", "connectionStatus", "listDatabases",
+		"bulkWrite", "renameCollection", "currentOp", "killOp", "serverStatus":
 		return true
 	}
 	return false
@@ -376,6 +400,25 @@ func (r *Rewriter) cmdAggregate(q *request) (*Result, error) {
 		return nil, err
 	}
 	ex := &extras{db: q.db}
+	if st, err := q.body.Lookup("pipeline").Array().Values(); err == nil && len(st) > 0 {
+		if d, ok := st[0].DocumentOK(); ok {
+			if e, err := d.IndexErr(0); err == nil {
+				switch e.Key() {
+				case "$collStats":
+					if _, isColl := q.e[0].Value().StringValueOK(); isColl && !q.noScope {
+						return r.statsStage(q, st)
+					}
+				case "$currentOp":
+					if q.db == "admin" && r.isCurrentOpAggregate(q.body) {
+						return r.currentOpAggregate(q, st)
+					}
+				}
+			}
+		}
+	}
+	if q.db == "admin" && !r.dbAllowed("admin") {
+		return nil, deny("database %q is not accessible", q.db)
+	}
 	if _, isColl := q.e[0].Value().StringValueOK(); !isColl {
 		// Database-level aggregate: only a change stream over the database.
 		if !r.isDBChangeStream(q) {
@@ -1026,4 +1069,22 @@ func (r *Rewriter) isDBChangeStream(q *request) bool {
 	}
 	e, err := d.IndexErr(0)
 	return err == nil && e.Key() == "$changeStream"
+}
+
+// isCurrentOpAggregate reports whether body is `aggregate: 1` whose first
+// stage is $currentOp (the only aggregate allowed on the admin database).
+func (r *Rewriter) isCurrentOpAggregate(body doc) bool {
+	if n, ok := body.Index(0).Value().AsInt64OK(); !ok || n != 1 {
+		return false
+	}
+	st, err := body.Lookup("pipeline").Array().Values()
+	if err != nil || len(st) == 0 {
+		return false
+	}
+	d, ok := st[0].DocumentOK()
+	if !ok {
+		return false
+	}
+	e, err := d.IndexErr(0)
+	return err == nil && e.Key() == "$currentOp"
 }

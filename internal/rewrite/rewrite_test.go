@@ -63,7 +63,7 @@ func TestMissingFilterGetsTenant(t *testing.T) {
 func TestRejections(t *testing.T) {
 	r := New(Config{})
 	cases := map[string]bson.D{
-		"unknown command":    {{Key: "dropDatabase", Value: 1}, {Key: "$db", Value: "app"}},
+		"unknown command":    {{Key: "createUser", Value: "u"}, {Key: "$db", Value: "app"}},
 		"admin db":           {{Key: "find", Value: "c"}, {Key: "$db", Value: "admin"}},
 		"system collection":  {{Key: "find", Value: "system.users"}, {Key: "$db", Value: "app"}},
 		"$where":             {{Key: "find", Value: "c"}, {Key: "filter", Value: bson.M{"$where": "1"}}, {Key: "$db", Value: "app"}},

@@ -38,6 +38,7 @@ type conn struct {
 	viewPhys map[int64]string      // view cursor id -> physical view collection
 	streams  map[int64]*fanout.Sub // virtual change stream cursors served by the fan-out
 	outID    int32
+	upAddr   string // local address of the upstream connection ($currentOp attribution)
 }
 
 func newConn(s *Server, nc net.Conn) *conn {
@@ -100,6 +101,9 @@ func (c *conn) cleanup() {
 	}
 	if c.up != nil {
 		c.killOpenCursors()
+		if c.upAddr != "" {
+			c.s.unregisterUp(c.tenant.ID, c.upAddr)
+		}
 		c.up.Close()
 	}
 	c.nc.Close()

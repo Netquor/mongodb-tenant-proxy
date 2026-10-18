@@ -25,9 +25,12 @@ app (driver) ──► mongodb-tenant-proxy ──► MongoDB (replica set / sta
 | `$changeStream` | collection- and database-level, on by default – see below |
 | `$merge` / `$out` | matched on `(tenantId, …)` with an auto-created unique index; documents stamped with the tenant; `$out` replaces only the tenant's documents |
 | views (`create`+`viewOn`, `collMod`, `drop`) | per-tenant hidden physical views with a tenant-scoped pipeline; see below |
-| `mapReduce` | inline output, query scoped |
+| `mapReduce` | query scoped; inline output, or `out` to a collection (replace / merge / reduce) installed per tenant |
+| `bulkWrite` (MongoDB 8.0 `client.bulkWrite`) | every op rewritten like insert/update/delete; every namespace validated; views are read-only |
+| `$search`, `$searchMeta`, `$vectorSearch` (Atlas) | tenant `equals` clause injected into the search (see below) |
+| `dropDatabase`, `renameCollection`, `collMod` (validators), `dbStats`, `collStats`/`$collStats`, `currentOp`/`$currentOp`, `killOp`, `serverStatus` | tenant-scoped versions, see "Admin commands" |
 
-Everything else is **denied** by default: `$currentOp`, `$collStats`, `$indexStats`, `$search`/`$vectorSearch` (Atlas), `$documents`, cluster-level change streams, `dropDatabase`, `renameCollection`, `collMod` on collections, `mapReduce` output to a collection, `system.*` and `__mtp_*` collections, `admin`/`local`/`config`, duplicate command keys, and unknown commands. Denials are returned as `Unauthorized (13)` and logged. Server-side JavaScript (`$where`, `$function`, `$accumulator`, `mapReduce`) is **allowed** — it runs inside `mongod` with the tenant filter wrapped around it and cannot reach other documents or collections; set `disableJS` to reject it.
+Everything else is **denied** by default: `$indexStats`, `$documents` (outside `$collStats`), cluster-level change streams, `validate`, `collMod` options other than a validator (see below), `system.*` and `__mtp_*` collections, `admin`/`local`/`config`, duplicate command keys, and unknown commands. Denials are returned as `Unauthorized (13)` and logged. Server-side JavaScript (`$where`, `$function`, `$accumulator`, `mapReduce`) is **allowed** — it runs inside `mongod` with the tenant filter wrapped around it and cannot reach other documents or collections; set `disableJS` to reject it.
 
 ## Views
 
@@ -35,7 +38,42 @@ A physical view is shared by every tenant, so it can't hold a per-tenant definit
 
 ## `$merge` / `$out`
 
-Output collections are shared, so writes are matched on `(tenantId, <on fields>)` using a unique index with exactly that key (created automatically). A tenant can never overwrite another tenant's document, and the stage re-stamps the tenant on every document. `$out` is emulated as "replace this tenant's documents": it merges with a run marker, then deletes the tenant's documents that weren't part of the run — so unlike a real `$out` it is **not atomic** (other tenants are unaffected). `$merge`/`$out` are allowed only as the last stage of a top-level aggregate.
+Output collections are shared, so writes are matched on `(tenantId, <on fields>)` using a unique index with exactly that key (created automatically). A tenant can never overwrite another tenant's document, and the stage re-stamps the tenant on every document. `$out` means "replace this tenant's documents". On a replica-set or sharded upstream it is **atomic**: the pipeline writes to a private staging collection (`__mtp_out_<run>`), then one transaction deletes the tenant's documents from the target and inserts the staged ones, so readers see the old or the new set, never a mix. If the transaction can't be used (standalone upstream, or it fails, e.g. because it is too large) the proxy falls back to the older emulation: merge with a run marker, then delete the tenant's documents that weren't part of the run — **not atomic**, other tenants unaffected. `$merge`/`$out` are allowed only as the last stage of a top-level aggregate.
+
+## Atlas Search and Vector Search
+
+`$search`, `$searchMeta` and `$vectorSearch` must be the first stage of a collection aggregate (or of a `$lookup`/`$unionWith` pipeline). The tenant restriction is made part of the search itself:
+
+* `$search` / `$searchMeta`: the client's operator is nested as `compound.must` and `{equals: {path: "tenantId", value: <tenant>}}` is added to `compound.filter` (filter clauses don't affect scoring). `$searchMeta` `facet.operator` is scoped the same way, `knnBeta` gets the tenant in its own `filter`. A `$match` on the tenant follows `$search`/`$vectorSearch` as defence in depth (skipped with `returnStoredSource`, where the tenant field may not be stored).
+* `$vectorSearch`: `filter` becomes `{$and: [{tenantId: {$eq: <tenant>}}, <client filter>]}`.
+
+**Index requirements:** the search index must map the tenant field as `token` (string tenant ids), `objectId` or `number`, and the vector index must declare the tenant field as a `{"type": "filter"}` field. Without that the server rejects the query; it never returns unscoped results. These stages only exist on Atlas / with `mongot`; they are verified by unit tests, not by the integration suite.
+
+## Admin commands
+
+All of these are computed from the tenant's own documents; none of them reads or changes another tenant's data.
+
+| Command | Behaviour |
+|---|---|
+| `dropDatabase` | deletes the tenant's documents in every collection of the database, drops the tenant's views and removes their validators. Collections are shared, so they are never dropped. |
+| `renameCollection` | tenant-scoped copy: the tenant's documents are `$merge`d into the target (secondary indexes of the source are recreated there, except TTL indexes) and deleted from the source. Same or another allowed database. Fails with `NamespaceExists` if the tenant already has documents in the target unless `dropTarget: true`. **Not atomic**: a crash between copy and delete leaves the documents in both collections, never in neither. |
+| `collMod` on a collection | only `validator`. It is stored per tenant (`__mtp_validators`) and the collection gets the AND of every tenant's validator, each wrapped as `{$or: [{tenantId: {$ne: T}}, <validator>]}`, so a validator only constrains its owner's documents. `listCollections` shows the caller's own validator. `validationLevel: "strict"` and `validationAction: "error"` (the defaults) are accepted as no-ops. Refused, because they change a property of the shared physical collection: `validationLevel`/`validationAction` otherwise, `index` (TTL expiry or `hidden` of a shared index would affect/delete other tenants' data), `expireAfterSeconds`, `cappedSize`/`cappedMax`, `changeStreamPreAndPostImages`, `timeseries`. `collMod` on views keeps working as before. Concurrent `collMod` calls on the same collection from different tenants can race while the combined validator is recomputed. |
+| `dbStats`, `collStats` | `count`, `objects`, `size`/`dataSize` and `avgObjSize` are exact for the tenant (one scan of the tenant's documents per collection). `storageSize`, `indexSize`, `totalIndexSize`, `indexSizes` are **estimates**: the real totals scaled by the tenant's share of the data; `nindexes`/`indexes` are real. `dbStats` counts a collection if the tenant has at least one document in it. Replies carry `tenantScoped: true`. |
+| `$collStats` | `count` and `storageStats` (same numbers as `collStats`), then the rest of the pipeline over that one document (needs `$documents`, MongoDB 5.1+). `latencyStats`/`queryExecStats` describe the whole shared collection and are refused. |
+| `validate` | refused: it scans and locks the entire shared collection and reports counts of every tenant's documents. |
+| `currentOp`, `$currentOp` | only operations on the tenant's own connections. Every client connection owns a dedicated upstream connection, and `$currentOp` reports the upstream peer of each operation, so the proxy filters on that. `$all`/`idleConnections` control idle entries; extra `currentOp` fields are a filter. Operations of the same tenant on *other proxy instances* are not listed. |
+| `killOp` | kills an operation only if it is listed by the tenant's `currentOp`; any other opid is answered like an unknown one (`ok: 1`, nothing killed). |
+| `serverStatus` | synthesized: `host`, `version`, `process`, `uptime`, `localTime`, `connections.current` (the tenant's connections). Real counters aggregate every tenant's activity and are not exposed. |
+
+These commands run on the tenant's upstream connection and cannot take part in a client transaction (they are refused inside one).
+
+## mapReduce output
+
+`mapReduce` with `out: "coll"`, `{replace|merge|reduce: "coll", db: "other"}` runs the map/reduce over the tenant's documents into a private staging collection, then installs the result for the tenant only: every result document carries `tenantId`; `replace` replaces just the tenant's results (atomically in one transaction on a replica set, like `$out`); `merge` overwrites results with the same key; `reduce` combines new and existing values with the command's `reduce` function (run through `$function`; `finalize` is applied to the new results but not again after combining, a small difference from the real command). `sharded` and `nonAtomic` are accepted and ignored. Output `_id`s are the map keys and `_id` is unique per collection, so two tenants emitting the same key into the same output collection collide (`E11000`) — the general `_id` limitation below. The reply is `{result, counts, timeMillis, ok}`. `mapReduce` is deprecated by MongoDB; prefer `$merge`.
+
+## `bulkWrite`
+
+MongoDB 8.0's cross-namespace `bulkWrite` (`client.bulkWrite` in current drivers) is supported with `ops`/`nsInfo` as document sequences or arrays. Each op is rewritten exactly like the single-collection handlers (inserts stamped, filters scoped, update operators/pipelines/replacements guarded, unknown op fields refused); each `nsInfo` namespace must be in an allowed database and not `system.*`/`__mtp_*`; a namespace that is the tenant's view is refused; `ordered` and `errorsOnly` are passed through. Cursors for large result sets are tracked like any other. Integration tests need mongod 8.0 and skip with a message otherwise.
 
 ## Identifying the tenant (`auth.mode`)
 
@@ -78,7 +116,7 @@ See [`proxy.example.json`](proxy.example.json). Metrics (`/metrics`, Prometheus 
 * `_id` is unique per *collection*, not per tenant. Use generated ObjectIds/UUIDs; a natural `_id` reused by two tenants will collide (and reveals existence).
 * Indexes are shared physical objects: one tenant creating an index affects all; `dropIndexes: "*"` is refused. Deny `createIndexes`/`dropIndexes` via `denyCommands` if tenants must not manage indexes. TTL indexes cannot carry the tenant prefix (unique TTL indexes are refused).
 * The `tenantId` field is visible in returned documents.
-* `mapReduce` can't write to a collection (use `$merge`); `listCollections` filters other than `name`/`type` don't apply to views.
+* `listCollections` filters other than `name`/`type` don't apply to views.
 * No wire compression (not advertised), no `SCRAM-SHA-1`/x.509 on the client side.
 * Session ids (`lsid`) are unguessable UUIDs but are not bound to a tenant.
 

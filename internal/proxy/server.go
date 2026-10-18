@@ -41,6 +41,10 @@ type Server struct {
 	// dbStreams records databases that have been watched at database level;
 	// writes to their collections get pre/post images enabled first.
 	dbStreams sync.Map
+	opsMu     sync.Mutex
+	upAddrs   map[string]map[string]struct{} // tenant -> upstream-side addresses of its connections
+	txnKnown  bool
+	txn       bool
 	steps     sync.Map // CacheKey -> struct{}: housekeeping commands already applied
 }
 
@@ -66,14 +70,15 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		M:      metrics.New(),
 		conns:  map[*conn]struct{}{},
 		tenant: map[string]int{},
-		rw: rewrite.New(rewrite.Config{
-			Field:         cfg.Tenant.Field,
-			Databases:     cfg.Databases,
-			DenyCommands:  cfg.DenyCommands,
-			AllowJS:       !cfg.DisableJS,
-			ChangeStreams: !cfg.ChangeStreams.Disabled,
-		}),
 	}
+	s.rw = rewrite.New(rewrite.Config{
+		Field:         cfg.Tenant.Field,
+		Databases:     cfg.Databases,
+		DenyCommands:  cfg.DenyCommands,
+		AllowJS:       !cfg.DisableJS,
+		ChangeStreams: !cfg.ChangeStreams.Disabled,
+		AtomicOut:     s.txnSupported,
+	})
 	if cs := cfg.ChangeStreams; !cs.Disabled && !cs.DisableFanout {
 		s.fan = fanout.NewManager(d, cfg.Tenant.Field, !cs.DisableAutoImages, cfg.MaxMessageBytes, log)
 	}

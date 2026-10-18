@@ -59,6 +59,15 @@ func (c *conn) handleMsg(h wire.Header, body []byte) error {
 		c.s.M.Command(name, "ok")
 		return c.reply(h, res.Reply)
 	}
+	if res.Run != nil {
+		return c.runResult(h, m, res)
+	}
+	if len(res.Namespaces) > 0 {
+		if err := c.checkBulkViews(res); err != nil {
+			c.s.M.Command(name, "denied")
+			return c.reply(h, c.runErrorDoc(err))
+		}
+	}
 	if res.Stream != nil && c.s.fan != nil {
 		if handled, err := c.openStream(h, m, res); handled || err != nil {
 			return err
@@ -78,6 +87,10 @@ func (c *conn) ensureUp() error {
 		return err
 	}
 	c.up = up
+	if c.tenant != nil {
+		c.upAddr = up.LocalAddr().String()
+		c.s.registerUp(c.tenant.ID, c.upAddr)
+	}
 	return nil
 }
 
@@ -167,7 +180,7 @@ func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMore
 
 func tracksCursor(cmd string) bool {
 	switch cmd {
-	case "find", "aggregate", "listIndexes", "listCollections", "getMore":
+	case "find", "aggregate", "listIndexes", "listCollections", "getMore", "bulkWrite":
 		return true
 	}
 	return false
@@ -418,6 +431,12 @@ steps:
 			if _, done := c.s.steps.Load(cmd.CacheKey); done {
 				continue
 			}
+		}
+		if cmd.Func != nil {
+			if err := cmd.Func(connUp{c}); err != nil {
+				return c.runErrorDoc(err)
+			}
+			continue
 		}
 		resp, err := c.s.dial.RunCommand(c.up, cmd.DB, cmd.Body)
 		if err != nil {
