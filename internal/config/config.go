@@ -2,10 +2,14 @@
 package config
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -19,6 +23,11 @@ type Config struct {
 	Upstream Upstream `json:"upstream"`
 	Tenant   Tenant   `json:"tenant"`
 	Auth     Auth     `json:"auth"`
+
+	// Compressors lists the wire compression algorithms (snappy, zlib, zstd)
+	// advertised to clients in hello, in preference order. Empty disables
+	// client-side compression.
+	Compressors []string `json:"compressors,omitempty"`
 
 	// Databases tenants may access. Empty means everything but admin/local/config.
 	Databases []string `json:"databases,omitempty"`
@@ -61,6 +70,37 @@ type ChangeStreams struct {
 type ClientTLS struct {
 	CertFile string `json:"certFile"`
 	KeyFile  string `json:"keyFile"`
+	// ClientCAFile is a PEM bundle of CAs that sign client certificates.
+	// Required for auth mode x509; the listener then verifies client certs
+	// (mandatory when x509 is the only mode, optional when combined).
+	ClientCAFile string `json:"clientCAFile,omitempty"`
+}
+
+// TLSConfig builds the listener's TLS configuration. requireClientCert makes
+// mutual TLS mandatory; with a ClientCAFile and no requirement, a certificate
+// is verified if the client presents one.
+func (t *ClientTLS) TLSConfig(requireClientCert bool) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
+	if err != nil {
+		return nil, err
+	}
+	tc := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	if t.ClientCAFile != "" {
+		pem, err := os.ReadFile(t.ClientCAFile)
+		if err != nil {
+			return nil, err
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, errors.New("clientTLS.clientCAFile contains no certificates")
+		}
+		tc.ClientCAs = pool
+		tc.ClientAuth = tls.VerifyClientCertIfGiven
+		if requireClientCert {
+			tc.ClientAuth = tls.RequireAndVerifyClientCert
+		}
+	}
+	return tc, nil
 }
 
 // Upstream describes the real MongoDB deployment.
@@ -75,6 +115,24 @@ type Upstream struct {
 	CAFile             string `json:"caFile,omitempty"`
 	InsecureSkipVerify bool   `json:"insecureSkipVerify,omitempty"`
 	DialTimeout        string `json:"dialTimeout,omitempty"`
+
+	// AuthMechanism selects how the proxy authenticates upstream:
+	// SCRAM-SHA-256 (default when a username is set), SCRAM-SHA-1,
+	// MONGODB-X509 (client certificate) or MONGODB-AWS.
+	AuthMechanism string `json:"authMechanism,omitempty"`
+	// CertFile/KeyFile is the client certificate presented to the upstream
+	// (required for MONGODB-X509, optional otherwise). Requires tls.
+	CertFile string `json:"certFile,omitempty"`
+	KeyFile  string `json:"keyFile,omitempty"`
+	// MONGODB-AWS credentials. When empty the username/password are used,
+	// then the AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN
+	// environment variables.
+	AWSAccessKeyID     string `json:"awsAccessKeyId,omitempty"`
+	AWSSecretAccessKey string `json:"awsSecretAccessKey,omitempty"`
+	AWSSessionToken    string `json:"awsSessionToken,omitempty"`
+	// Compressors lists the wire compressors negotiated with the upstream
+	// (snappy, zlib, zstd), in preference order. Empty disables compression.
+	Compressors []string `json:"compressors,omitempty"`
 }
 
 // Tenant describes how tenant ownership is stored in documents.
@@ -85,27 +143,119 @@ type Tenant struct {
 	IDType string `json:"idType,omitempty"`
 }
 
-// Auth selects how a connection learns its tenant.
+// Mode names the client authentication mechanisms in use. In JSON it is
+// either a string ("scram") or a list (["scram", "scram-sha-1", "x509"]).
 //
-//	scram    - clients authenticate with SCRAM-SHA-256; each user maps to a tenant.
-//	appname  - tenant is the driver's appName ("<tenant>" or "<tenant>.<hmac>").
-//	static   - every connection belongs to StaticTenant (run one proxy per tenant).
-type Auth struct {
-	Mode          string `json:"mode"`
-	StaticTenant  string `json:"staticTenant,omitempty"`
-	AppNameSecret string `json:"appNameSecret,omitempty"`
-	Users         []User `json:"users,omitempty"`
+//	scram        - SCRAM-SHA-256; each user maps to a tenant.
+//	scram-sha-1  - SCRAM-SHA-1 with the legacy MD5 password digest.
+//	x509         - MONGODB-X509: the client certificate subject/SAN maps to a tenant.
+//	oidc         - MONGODB-OIDC: a JWT whose claim carries the tenant id.
+//	appname      - tenant is the driver's appName ("<tenant>" or "<tenant>.<hmac>").
+//	static       - every connection belongs to StaticTenant.
+//
+// scram, scram-sha-1, x509 and oidc can be combined; appname and static stand
+// alone. Internally a list is kept comma separated.
+type Mode string
+
+// List returns the individual mode names.
+func (m Mode) List() []string {
+	var out []string
+	for _, p := range strings.Split(string(m), ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
-// User is a SCRAM-SHA-256 credential bound to a tenant. Use the `hash-password`
-// subcommand to generate the salted values.
+// Has reports whether the mode is enabled.
+func (m Mode) Has(name string) bool {
+	for _, p := range m.List() {
+		if p == name {
+			return true
+		}
+	}
+	return false
+}
+
+// UnmarshalJSON accepts a string or a list of strings.
+func (m *Mode) UnmarshalJSON(b []byte) error {
+	var one string
+	if err := json.Unmarshal(b, &one); err == nil {
+		*m = Mode(one)
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(b, &many); err != nil {
+		return errors.New("auth.mode must be a string or a list of strings")
+	}
+	*m = Mode(strings.Join(many, ","))
+	return nil
+}
+
+// MarshalJSON emits a string for one mode and a list for several.
+func (m Mode) MarshalJSON() ([]byte, error) {
+	if l := m.List(); len(l) > 1 {
+		return json.Marshal(l)
+	}
+	return json.Marshal(string(m))
+}
+
+// Auth selects how a connection learns its tenant. See Mode.
+type Auth struct {
+	Mode          Mode       `json:"mode"`
+	StaticTenant  string     `json:"staticTenant,omitempty"`
+	AppNameSecret string     `json:"appNameSecret,omitempty"`
+	Users         []User     `json:"users,omitempty"`
+	X509          []X509Rule `json:"x509,omitempty"`
+	OIDC          *OIDC      `json:"oidc,omitempty"`
+}
+
+// User is a SCRAM credential bound to a tenant. The flat fields are the
+// SCRAM-SHA-256 credential; SHA1 is the SCRAM-SHA-1 credential. Use the
+// `hash-password` subcommand to generate them.
 type User struct {
 	Username   string `json:"username"`
 	TenantID   string `json:"tenantId"`
-	Salt       string `json:"salt"` // base64
+	Salt       string `json:"salt,omitempty"` // base64
+	Iterations int    `json:"iterations,omitempty"`
+	StoredKey  string `json:"storedKey,omitempty"` // base64
+	ServerKey  string `json:"serverKey,omitempty"` // base64
+
+	SHA1 *SCRAMCredential `json:"sha1,omitempty"`
+}
+
+// SCRAMCredential is a stored SCRAM credential (salt and keys are base64).
+type SCRAMCredential struct {
+	Salt       string `json:"salt"`
 	Iterations int    `json:"iterations"`
-	StoredKey  string `json:"storedKey"` // base64
-	ServerKey  string `json:"serverKey"` // base64
+	StoredKey  string `json:"storedKey"`
+	ServerKey  string `json:"serverKey"`
+}
+
+// X509Rule maps a client certificate to a tenant. A certificate matches when
+// its subject equals Subject (RFC 2253 form, e.g. "CN=alice,O=acme") or any
+// of its SANs (DNS name, e-mail, URI or IP) equals SAN.
+type X509Rule struct {
+	Subject  string `json:"subject,omitempty"`
+	SAN      string `json:"san,omitempty"`
+	TenantID string `json:"tenantId"`
+}
+
+// OIDC configures MONGODB-OIDC / JWT bearer authentication. Tokens must be
+// signed with a key from the JWKS (RS256/384/512, ES256/384/512).
+type OIDC struct {
+	Issuer   string `json:"issuer"`
+	Audience string `json:"audience"`
+	// JWKSFile or JWKSURI supplies the verification keys.
+	JWKSFile string `json:"jwksFile,omitempty"`
+	JWKSURI  string `json:"jwksUri,omitempty"`
+	// JWKSRefresh is how often a JWKS URI is re-fetched (default 10m).
+	JWKSRefresh string `json:"jwksRefresh,omitempty"`
+	// TenantClaim holds the tenant id (default "tenant").
+	TenantClaim string `json:"tenantClaim,omitempty"`
+	// ClockSkew tolerated for exp/nbf (default 30s).
+	ClockSkew string `json:"clockSkew,omitempty"`
 }
 
 // Load reads a config file (if path is non-empty), applies environment
@@ -166,6 +316,12 @@ func (c *Config) finish() error {
 		if q.Get("tls") == "true" || q.Get("ssl") == "true" {
 			u.TLS = true
 		}
+		if v := q.Get("authMechanism"); v != "" {
+			u.AuthMechanism = v
+		}
+		if v := q.Get("compressors"); v != "" && len(u.Compressors) == 0 {
+			u.Compressors = strings.Split(v, ",")
+		}
 	}
 	if u.Addr == "" {
 		u.Addr = "localhost:27017"
@@ -173,18 +329,17 @@ func (c *Config) finish() error {
 	if u.AuthSource == "" {
 		u.AuthSource = "admin"
 	}
-	switch c.Auth.Mode {
-	case "scram":
-		if len(c.Auth.Users) == 0 {
-			return fmt.Errorf("auth.mode=scram requires auth.users")
-		}
-	case "appname":
-	case "static":
-		if c.Auth.StaticTenant == "" {
-			return fmt.Errorf("auth.mode=static requires auth.staticTenant")
-		}
-	default:
-		return fmt.Errorf("auth.mode must be one of scram, appname, static")
+	if err := c.validateAuth(); err != nil {
+		return err
+	}
+	if err := validateCompressors("compressors", c.Compressors); err != nil {
+		return err
+	}
+	if err := validateCompressors("upstream.compressors", u.Compressors); err != nil {
+		return err
+	}
+	if err := u.validateAuth(); err != nil {
+		return err
 	}
 	for _, d := range []string{c.IdleTimeout, u.DialTimeout} {
 		if d != "" {
@@ -208,4 +363,123 @@ func (c *Config) DialDuration() time.Duration {
 		return d
 	}
 	return 10 * time.Second
+}
+
+func validateCompressors(field string, list []string) error {
+	for _, n := range list {
+		switch strings.ToLower(n) {
+		case "snappy", "zlib", "zstd":
+		default:
+			return fmt.Errorf("%s: unknown compressor %q (want snappy, zlib or zstd)", field, n)
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateAuth() error {
+	a := &c.Auth
+	modes := a.Mode.List()
+	if len(modes) == 0 {
+		return fmt.Errorf("auth.mode must be one of scram, scram-sha-1, x509, oidc, appname, static")
+	}
+	for _, m := range modes {
+		switch m {
+		case "scram":
+			if !a.anyUser(func(u User) bool { return u.StoredKey != "" }) {
+				return fmt.Errorf("auth.mode=scram requires auth.users")
+			}
+		case "scram-sha-1":
+			if !a.anyUser(func(u User) bool { return u.SHA1 != nil }) {
+				return fmt.Errorf("auth.mode=scram-sha-1 requires auth.users with a sha1 credential (hash-password -sha1)")
+			}
+		case "x509":
+			if len(a.X509) == 0 {
+				return fmt.Errorf("auth.mode=x509 requires auth.x509 rules")
+			}
+			for i, r := range a.X509 {
+				if r.TenantID == "" || (r.Subject == "" && r.SAN == "") {
+					return fmt.Errorf("auth.x509[%d]: tenantId and subject or san are required", i)
+				}
+			}
+			if c.ClientTLS == nil || c.ClientTLS.ClientCAFile == "" {
+				return fmt.Errorf("auth.mode=x509 requires clientTLS with clientCAFile (mutual TLS)")
+			}
+		case "oidc":
+			o := a.OIDC
+			if o == nil || o.Issuer == "" || o.Audience == "" || (o.JWKSFile == "") == (o.JWKSURI == "") {
+				return fmt.Errorf("auth.mode=oidc requires auth.oidc with issuer, audience and exactly one of jwksFile/jwksUri")
+			}
+			for _, d := range []string{o.JWKSRefresh, o.ClockSkew} {
+				if d != "" {
+					if _, err := time.ParseDuration(d); err != nil {
+						return fmt.Errorf("auth.oidc: %w", err)
+					}
+				}
+			}
+		case "appname":
+			if len(modes) > 1 {
+				return fmt.Errorf("auth.mode=appname cannot be combined with other modes")
+			}
+		case "static":
+			if len(modes) > 1 {
+				return fmt.Errorf("auth.mode=static cannot be combined with other modes")
+			}
+			if a.StaticTenant == "" {
+				return fmt.Errorf("auth.mode=static requires auth.staticTenant")
+			}
+		default:
+			return fmt.Errorf("auth.mode must be one of scram, scram-sha-1, x509, oidc, appname, static")
+		}
+	}
+	return nil
+}
+
+func (a *Auth) anyUser(f func(User) bool) bool {
+	for _, u := range a.Users {
+		if f(u) {
+			return true
+		}
+	}
+	return false
+}
+
+// Mechanism returns the effective upstream authentication mechanism ("" when
+// the proxy does not authenticate upstream).
+func (u *Upstream) Mechanism() string {
+	if u.AuthMechanism != "" {
+		return strings.ToUpper(u.AuthMechanism)
+	}
+	if u.Username != "" {
+		return "SCRAM-SHA-256"
+	}
+	return ""
+}
+
+func (u *Upstream) validateAuth() error {
+	switch u.Mechanism() {
+	case "", "SCRAM-SHA-256", "SCRAM-SHA-1":
+		if u.AuthMechanism != "" && u.Username == "" {
+			return fmt.Errorf("upstream.authMechanism=%s requires a username", u.AuthMechanism)
+		}
+	case "MONGODB-X509":
+		if !u.TLS || u.CertFile == "" || u.KeyFile == "" {
+			return fmt.Errorf("upstream MONGODB-X509 requires tls, certFile and keyFile")
+		}
+	case "MONGODB-AWS":
+	default:
+		return fmt.Errorf("upstream.authMechanism %q unsupported (SCRAM-SHA-256, SCRAM-SHA-1, MONGODB-X509, MONGODB-AWS)", u.AuthMechanism)
+	}
+	if (u.CertFile == "") != (u.KeyFile == "") {
+		return fmt.Errorf("upstream.certFile and keyFile go together")
+	}
+	return nil
+}
+
+// ListenerTLS builds the client listener's TLS configuration (nil when
+// clientTLS is unset). Mutual TLS is mandatory when x509 is the only mode.
+func (c *Config) ListenerTLS() (*tls.Config, error) {
+	if c.ClientTLS == nil {
+		return nil, nil
+	}
+	return c.ClientTLS.TLSConfig(c.Auth.Mode.Has("x509") && len(c.Auth.Mode.List()) == 1)
 }

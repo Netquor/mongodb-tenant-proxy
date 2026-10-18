@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -28,6 +29,8 @@ type conn struct {
 	br  *bufio.Reader
 	id  int64
 	log *slog.Logger
+
+	reqComp wire.Compressor // compressor of the request being handled (replies mirror it)
 
 	tenant     *rewrite.Tenant
 	tenantHeld bool
@@ -59,7 +62,7 @@ func (c *conn) serve(ctx context.Context) {
 	defer s.M.ConnsActive.Add(-1)
 	defer c.cleanup()
 
-	if s.auth.Mode() == "static" {
+	if s.auth.Has("static") {
 		if err := c.bindTenant(s.auth.StaticTenant()); err != nil {
 			c.log.Warn("rejecting connection", "err", err)
 			return
@@ -78,6 +81,14 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 		s.M.BytesIn.Add(int64(h.Length))
+		c.reqComp = wire.CompNone
+		if h.OpCode == wire.OpCompressed {
+			h, body, err = c.decompress(h, body)
+			if err != nil {
+				c.log.Debug("bad OP_COMPRESSED", "err", err)
+				return
+			}
+		}
 		switch h.OpCode {
 		case wire.OpMsg:
 			err = c.handleMsg(h, body)
@@ -92,6 +103,35 @@ func (c *conn) serve(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// decompress unwraps an OP_COMPRESSED request and remembers the compressor so
+// the reply can mirror it, as mongod does.
+func (c *conn) decompress(h wire.Header, body []byte) (wire.Header, []byte, error) {
+	id, ok := wire.CompressorID(body)
+	if !ok || !c.s.clientComp[id] {
+		return h, nil, fmt.Errorf("compressor %d not enabled", id)
+	}
+	op, _, data, err := wire.Decompress(body, c.s.cfg.MaxMessageBytes)
+	if err != nil {
+		return h, nil, err
+	}
+	c.reqComp = id
+	h.OpCode, h.Length = op, int32(len(data)+16)
+	return h, data, nil
+}
+
+// send writes a reply frame to the client, compressing it with the
+// compressor of the request being answered (never for legacy OP_REPLY).
+func (c *conn) send(requestID, responseTo, opcode int32, body []byte) error {
+	if c.reqComp != wire.CompNone && opcode == wire.OpMsg {
+		cb, err := wire.Compress(c.reqComp, opcode, body)
+		if err != nil {
+			return err
+		}
+		return wire.WriteFrame(c.nc, requestID, responseTo, wire.OpCompressed, cb)
+	}
+	return wire.WriteFrame(c.nc, requestID, responseTo, opcode, body)
 }
 
 func (c *conn) cleanup() {
@@ -158,7 +198,7 @@ func (c *conn) reply(h wire.Header, d bsoncore.Document) error {
 	m := wire.Msg{Body: d}
 	b := m.Encode()
 	c.s.M.BytesOut.Add(int64(len(b) + 16))
-	return wire.WriteFrame(c.nc, c.nextRequestID(), h.RequestID, wire.OpMsg, b)
+	return c.send(c.nextRequestID(), h.RequestID, wire.OpMsg, b)
 }
 
 func errorDoc(code int32, codeName, msg string) bsoncore.Document {

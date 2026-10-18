@@ -22,7 +22,7 @@ import (
 
 const usage = `usage:
   mongodb-tenant-proxy [serve] -config proxy.json [-listen :27018]
-  mongodb-tenant-proxy hash-password -user NAME -tenant TENANT   (password read from $MTP_PASSWORD or stdin prompt)
+  mongodb-tenant-proxy hash-password -user NAME -tenant TENANT [-mechanism sha256|sha1|both]   (password read from $MTP_PASSWORD)
   mongodb-tenant-proxy sign-appname -secret SECRET -tenant TENANT
 `
 
@@ -77,12 +77,12 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	if t := cfg.ClientTLS; t != nil {
-		cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
+	if cfg.ClientTLS != nil {
+		tc, err := cfg.ListenerTLS()
 		if err != nil {
 			return err
 		}
-		ln = tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+		ln = tls.NewListener(ln, tc)
 	}
 	if cfg.MetricsAddr != "" {
 		go func() {
@@ -102,6 +102,7 @@ func hashPassword(args []string) error {
 	fs := flag.NewFlagSet("hash-password", flag.ExitOnError)
 	user := fs.String("user", "", "username")
 	tenant := fs.String("tenant", "", "tenant id the user is bound to")
+	mech := fs.String("mechanism", "sha256", "credential to generate: sha256 (SCRAM-SHA-256), sha1 (SCRAM-SHA-1, legacy MD5 digest) or both")
 	fs.Parse(args)
 	pw := os.Getenv("MTP_PASSWORD")
 	if pw == "" {
@@ -110,9 +111,24 @@ func hashPassword(args []string) error {
 	if *user == "" || *tenant == "" {
 		return fmt.Errorf("-user and -tenant are required")
 	}
-	u, err := auth.NewUser(*user, *tenant, pw)
-	if err != nil {
-		return err
+	var u config.User
+	var err error
+	switch *mech {
+	case "sha256", "sha1", "both":
+	default:
+		return fmt.Errorf("-mechanism must be sha256, sha1 or both")
+	}
+	if *mech != "sha1" {
+		if u, err = auth.NewUser(*user, *tenant, pw); err != nil {
+			return err
+		}
+	} else {
+		u = config.User{Username: *user, TenantID: *tenant}
+	}
+	if *mech != "sha256" {
+		if u.SHA1, err = auth.NewSHA1Credential(*user, pw); err != nil {
+			return err
+		}
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")

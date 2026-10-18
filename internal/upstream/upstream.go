@@ -27,6 +27,9 @@ import (
 type Conn struct {
 	net.Conn
 	R *bufio.Reader
+	// Comp is the wire compressor negotiated with the upstream
+	// (wire.CompNone when compression is off).
+	Comp wire.Compressor
 }
 
 // Dialer opens upstream connections.
@@ -35,6 +38,7 @@ type Dialer struct {
 	dial   net.Dialer
 	tls    *tls.Config
 	max    int
+	comps  []wire.Compressor // upstream.compressors, in preference order
 	ids    atomic.Int32
 	images sync.Map // "db.coll" -> struct{}
 }
@@ -44,6 +48,9 @@ func NewDialer(cfg *config.Config) (*Dialer, error) {
 	d := &Dialer{cfg: cfg.Upstream, max: cfg.MaxMessageBytes}
 	if d.cfg.AuthSource == "" {
 		d.cfg.AuthSource = "admin"
+	}
+	if err := d.init(); err != nil {
+		return nil, err
 	}
 	d.dial.Timeout = cfg.DialDuration()
 	d.dial.KeepAlive = 30e9
@@ -59,6 +66,13 @@ func NewDialer(cfg *config.Config) (*Dialer, error) {
 				return nil, errors.New("upstream.caFile contains no certificates")
 			}
 			tc.RootCAs = pool
+		}
+		if cfg.Upstream.CertFile != "" {
+			cert, err := tls.LoadX509KeyPair(cfg.Upstream.CertFile, cfg.Upstream.KeyFile)
+			if err != nil {
+				return nil, fmt.Errorf("upstream client certificate: %w", err)
+			}
+			tc.Certificates = []tls.Certificate{cert}
 		}
 		d.tls = tc
 	}
@@ -85,7 +99,11 @@ func (d *Dialer) Dial(ctx context.Context) (*Conn, error) {
 		nc = tconn
 	}
 	c := &Conn{Conn: nc, R: bufio.NewReaderSize(nc, 64*1024)}
-	if d.cfg.Username != "" {
+	if err := d.negotiateCompression(c); err != nil {
+		nc.Close()
+		return nil, fmt.Errorf("upstream compression: %w", err)
+	}
+	if d.cfg.Mechanism() != "" {
 		if err := d.authenticate(c); err != nil {
 			nc.Close()
 			return nil, fmt.Errorf("upstream authentication: %w", err)
@@ -136,8 +154,14 @@ func (d *Dialer) Hello(ctx context.Context) (bsoncore.Document, error) {
 	return d.RunCommand(c, "admin", cmd)
 }
 
-func (d *Dialer) authenticate(c *Conn) error {
-	client, err := scram.SHA256.NewClient(d.cfg.Username, d.cfg.Password, "")
+func (d *Dialer) authSCRAM(c *Conn, mech string) error {
+	var client *scram.Client
+	var err error
+	if mech == "SCRAM-SHA-1" {
+		client, err = scram.SHA1.NewClient(d.cfg.Username, sha1Password(d.cfg.Username, d.cfg.Password), "")
+	} else {
+		client, err = scram.SHA256.NewClient(d.cfg.Username, d.cfg.Password, "")
+	}
 	if err != nil {
 		return err
 	}
@@ -149,7 +173,7 @@ func (d *Dialer) authenticate(c *Conn) error {
 	opts := bsoncore.BuildDocument(nil, bsoncore.AppendBooleanElement(nil, "skipEmptyExchange", true))
 	cmd := bsoncore.BuildDocument(nil,
 		bsoncore.AppendInt32Element(nil, "saslStart", 1),
-		bsoncore.AppendStringElement(nil, "mechanism", "SCRAM-SHA-256"),
+		bsoncore.AppendStringElement(nil, "mechanism", mech),
 		bsoncore.AppendBinaryElement(nil, "payload", 0, []byte(payload)),
 		bsoncore.AppendDocumentElement(nil, "options", opts),
 	)

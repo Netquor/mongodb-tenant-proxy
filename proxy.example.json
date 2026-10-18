@@ -6,6 +6,7 @@
   },
   "tenant": { "field": "tenantId", "idType": "string" },
   "databases": ["app"],
+  "compressors": ["zstd", "snappy", "zlib"],
   "auth": {
     "mode": "scram",
     "users": [
