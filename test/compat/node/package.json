@@ -1,0 +1,7 @@
+{
+  "name": "mtp-compat-node",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": { "test": "node scenario.mjs && node mongoose.mjs" },
+  "dependencies": { "mongodb": "^6.10.0", "mongoose": "^8.8.0" }
+}

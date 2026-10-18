@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,9 +41,24 @@ func freePort(t testing.TB) int {
 // startMongod launches a throwaway replica-set member.
 func startMongod(t testing.TB, withAuth bool) (addr string) {
 	t.Helper()
-	bin, err := exec.LookPath("mongod")
+	// MTP_MONGOD_URI points at an already-running, initiated single-node
+	// replica set (e.g. a CI service container) as host:port or mongodb://host:port.
+	if u := os.Getenv("MTP_MONGOD_URI"); u != "" {
+		if withAuth {
+			t.Skip("auth-enabled upstream not supported with MTP_MONGOD_URI")
+		}
+		addr = strings.TrimSuffix(strings.TrimPrefix(u, "mongodb://"), "/")
+		resetUpstream(t, addr)
+		return addr
+	}
+	// MTP_MONGOD_BIN overrides the mongod binary looked up in PATH.
+	binName := "mongod"
+	if v := os.Getenv("MTP_MONGOD_BIN"); v != "" {
+		binName = v
+	}
+	bin, err := exec.LookPath(binName)
 	if err != nil {
-		t.Skip("mongod not found in PATH")
+		t.Skip(binName + " not found")
 	}
 	dir := t.TempDir()
 	port := freePort(t)
@@ -123,6 +139,9 @@ const upstreamPassword = "upstream-pw-1"
 func setupWith(t testing.TB, withAuth bool, mutate func(*config.Config)) *env {
 	t.Helper()
 	up := startMongod(t, withAuth)
+	if strings.Contains(t.Name(), "ChangeStream") && upstreamWireVersion(t, up) < 17 {
+		t.Skip("change streams need MongoDB 6.0+ (collection pre/post images)")
+	}
 	cfg := &config.Config{
 		Listen:   "127.0.0.1:0",
 		Upstream: config.Upstream{Addr: up},
@@ -170,4 +189,40 @@ func (e *env) tenant(t testing.TB, id string) *mongo.Client {
 	c := connect(t, fmt.Sprintf("mongodb://%s/?appName=%s", e.proxyAddr, id))
 	t.Cleanup(func() { c.Disconnect(context.Background()) })
 	return c
+}
+
+// resetUpstream drops every non-system database so tests sharing a long-lived
+// mongod (MTP_MONGOD_URI) start from a clean slate.
+func resetUpstream(t testing.TB, addr string) {
+	t.Helper()
+	c := connect(t, fmt.Sprintf("mongodb://%s/?directConnection=true", addr))
+	defer c.Disconnect(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	names, err := c.ListDatabaseNames(ctx, bson.D{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range names {
+		switch n {
+		case "admin", "local", "config":
+			continue
+		}
+		if err := c.Database(n).Drop(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func upstreamWireVersion(t testing.TB, addr string) int32 {
+	t.Helper()
+	c := connect(t, fmt.Sprintf("mongodb://%s/?directConnection=true", addr))
+	defer c.Disconnect(context.Background())
+	var res struct {
+		MaxWireVersion int32 `bson:"maxWireVersion"`
+	}
+	if err := c.Database("admin").RunCommand(context.Background(), bson.D{{Key: "hello", Value: 1}}).Decode(&res); err != nil {
+		t.Fatal(err)
+	}
+	return res.MaxWireVersion
 }
