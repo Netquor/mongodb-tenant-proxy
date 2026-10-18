@@ -13,6 +13,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 
+	"github.com/netquor/mongodb-tenant-proxy/internal/audit"
 	"github.com/netquor/mongodb-tenant-proxy/internal/auth"
 	"github.com/netquor/mongodb-tenant-proxy/internal/fanout"
 	"github.com/netquor/mongodb-tenant-proxy/internal/limits"
@@ -31,6 +32,7 @@ type conn struct {
 	br  *bufio.Reader
 	id  int64
 	log *slog.Logger
+	connOps
 
 	reqComp wire.Compressor // compressor of the request being handled (replies mirror it)
 
@@ -53,7 +55,7 @@ type conn struct {
 
 func newConn(s *Server, nc net.Conn) *conn {
 	id := s.nextID.Add(1)
-	return &conn{
+	c := &conn{
 		s: s, nc: nc, id: id,
 		br:       bufio.NewReaderSize(nc, 64*1024),
 		cursors:  map[int64]string{},
@@ -61,6 +63,8 @@ func newConn(s *Server, nc net.Conn) *conn {
 		viewPhys: map[int64]string{},
 		log:      s.log.With("conn", id, "remote", nc.RemoteAddr().String()),
 	}
+	c.initOps()
+	return c
 }
 
 func (c *conn) serve(ctx context.Context) {
@@ -69,26 +73,32 @@ func (c *conn) serve(ctx context.Context) {
 	s.M.ConnsActive.Add(1)
 	defer s.M.ConnsActive.Add(-1)
 	defer c.cleanup()
+	s.audit.Log(c.event(audit.Connect))
 
 	if s.auth.Has("static") {
 		if err := c.bindTenant(s.auth.StaticTenant()); err != nil {
 			c.log.Warn("rejecting connection", "err", err)
+			c.authFail("", err.Error())
 			return
 		}
+		c.authOK()
 	}
-	idle := s.cfg.IdleDuration()
 	for {
-		if idle > 0 {
+		if idle := s.rt().idle; idle > 0 {
 			c.nc.SetReadDeadline(time.Now().Add(idle))
 		}
-		h, body, err := wire.ReadFrame(c.br, s.cfg.MaxMessageBytes)
+		h, body, err := wire.ReadFrame(c.br, s.rt().maxMessage)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && ctx.Err() == nil {
 				c.log.Debug("read failed", "err", err)
 			}
 			return
 		}
-		s.M.BytesIn.Add(int64(h.Length))
+		c.countIn(int64(h.Length))
+		if why, bad := c.revoked(); bad {
+			c.kill(why)
+			return
+		}
 		c.reqComp = wire.CompNone
 		if h.OpCode == wire.OpCompressed {
 			h, body, err = c.decompress(h, body)
@@ -110,6 +120,7 @@ func (c *conn) serve(ctx context.Context) {
 			c.log.Debug("closing connection", "err", err)
 			return
 		}
+		c.endMsg()
 	}
 }
 
@@ -156,6 +167,14 @@ func (c *conn) send(requestID, responseTo, opcode int32, body []byte) error {
 }
 
 func (c *conn) cleanup() {
+	e := c.event(audit.Disconnect)
+	if why := c.killed.Load(); why != nil {
+		e.Reason = *why
+		if *why != "killed by admin" {
+			e.Type = audit.ConnKilled
+		}
+	}
+	c.s.audit.Log(e)
 	for _, sub := range c.streams {
 		sub.Close()
 	}
@@ -207,6 +226,9 @@ func (c *conn) bindTenant(id string) error {
 	if err != nil {
 		return err
 	}
+	if c.s.reg.Disabled(id) {
+		return errors.New("tenant disabled")
+	}
 	if !c.s.acquireTenant(id) {
 		return errors.New("tenant connection limit reached")
 	}
@@ -215,6 +237,7 @@ func (c *conn) bindTenant(id string) error {
 	}
 	c.tenant, c.tenantHeld = t, true
 	c.lim = c.s.lim.For(id)
+	c.onBind(id)
 	c.log = c.log.With("tenant", id)
 	return nil
 }
@@ -226,7 +249,7 @@ func (c *conn) nextRequestID() int32 { c.outID++; return c.outID }
 func (c *conn) reply(h wire.Header, d bsoncore.Document) error {
 	m := wire.Msg{Body: d}
 	b := m.Encode()
-	c.s.M.BytesOut.Add(int64(len(b) + 16))
+	c.countOut(int64(len(b) + 16))
 	if c.lim != nil {
 		c.lim.CountReply(len(b) + 16)
 	}

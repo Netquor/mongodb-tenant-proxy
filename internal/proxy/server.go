@@ -17,7 +17,6 @@ import (
 	"github.com/netquor/mongodb-tenant-proxy/internal/fanout"
 	"github.com/netquor/mongodb-tenant-proxy/internal/limits"
 	"github.com/netquor/mongodb-tenant-proxy/internal/metrics"
-	"github.com/netquor/mongodb-tenant-proxy/internal/rewrite"
 	"github.com/netquor/mongodb-tenant-proxy/internal/upstream"
 	"github.com/netquor/mongodb-tenant-proxy/internal/wire"
 )
@@ -26,11 +25,11 @@ import (
 type Server struct {
 	cfg  *config.Config
 	auth *auth.Authenticator
-	rw   *rewrite.Rewriter
 	dial *upstream.Dialer
 	log  *slog.Logger
 	M    *metrics.Registry
 
+	opsState
 	limits helloLimits
 	lim    *limits.Manager
 	sess   *sessionTable
@@ -78,26 +77,20 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		auth:   a,
 		dial:   d,
 		log:    log,
-		M:      metrics.New(),
+		M:      metrics.NewWith(cfg.Metrics.TenantLabel),
 		conns:  map[*conn]struct{}{},
 		tenant: map[string]int{},
 		lim:    limits.NewManager(cfg, nil),
 	}
-	s.rw = rewrite.New(rewrite.Config{
-		Field:         cfg.Tenant.Field,
-		Databases:     cfg.Databases,
-		DenyCommands:  cfg.DenyCommands,
-		AllowJS:       !cfg.DisableJS,
-		ChangeStreams: !cfg.ChangeStreams.Disabled,
-		IDPolicy:      cfg.Tenant.IDPolicy,
-		AtomicOut:     s.txnSupported,
-	})
 	s.clientComp = map[wire.Compressor]bool{}
 	for _, n := range cfg.Compressors {
 		if id, ok := wire.CompressorByName(n); ok && !s.clientComp[id] {
 			s.clientComp[id] = true
 			s.clientCompList = append(s.clientCompList, id)
 		}
+	}
+	if err := s.initOps(context.Background(), cfg); err != nil {
+		return nil, err
 	}
 	if cs := cfg.ChangeStreams; !cs.Disabled && !cs.DisableFanout {
 		s.fan = fanout.NewManager(d, cfg.Tenant.Field, !cs.DisableAutoImages, cfg.MaxMessageBytes, log)
@@ -129,6 +122,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 
 // Serve accepts connections until ctx is cancelled or the listener fails.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	go s.reg.Run(ctx, s.cfg.Store.RefreshDuration(), func(err error) { s.log.Warn("tenant store refresh failed", "err", err) })
 	go func() {
 		<-ctx.Done()
 		ln.Close()
@@ -168,13 +162,19 @@ func (s *Server) shutdown() {
 	}
 	s.mu.Unlock()
 	s.wg.Wait()
+	s.audit.Close()
+	s.reg.Close()
 }
 
 // acquireTenant enforces the per-tenant connection cap.
 func (s *Server) acquireTenant(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if m := s.cfg.MaxConnsPerTenant; m > 0 && s.tenant[id] >= m {
+	m := s.rt().maxConns
+	if o := s.reg.MaxConns(id); o > 0 {
+		m = o
+	}
+	if m > 0 && s.tenant[id] >= m {
 		return false
 	}
 	s.tenant[id]++

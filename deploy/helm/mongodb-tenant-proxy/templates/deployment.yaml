@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mtp.fullname" . }}
+  labels: {{- include "mtp.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels: {{- include "mtp.selector" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  template:
+    metadata:
+      labels: {{- include "mtp.selector" . | nindent 8 }}
+      annotations:
+        {{- if .Values.rollOnConfigChange }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: proxy
+          image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve", "-config", "/etc/mongodb-tenant-proxy/proxy.json"]
+          envFrom:
+            - secretRef:
+                name: {{ include "mtp.secretName" . }}
+          ports:
+            - { name: mongo, containerPort: {{ include "mtp.port" .Values.config.listen }} }
+            - { name: metrics, containerPort: {{ include "mtp.port" .Values.config.metricsAddr }} }
+            {{- if .Values.config.adminAddr }}
+            - { name: admin, containerPort: {{ include "mtp.port" .Values.config.adminAddr }} }
+            {{- end }}
+          livenessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            periodSeconds: 5
+          startupProbe:
+            httpGet: { path: /healthz, port: metrics }
+            failureThreshold: 30
+            periodSeconds: 2
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/mongodb-tenant-proxy, readOnly: true }
+            - { name: data, mountPath: /var/lib/mongodb-tenant-proxy }
+            {{- with .Values.extraVolumeMounts }}{{ toYaml . | nindent 12 }}{{- end }}
+      volumes:
+        - name: config
+          configMap: { name: {{ include "mtp.fullname" . }} }
+        - name: data
+          emptyDir: {}
+        {{- with .Values.extraVolumes }}{{ toYaml . | nindent 8 }}{{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        {{- if .Values.affinity }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- else }}
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: {{- include "mtp.selector" . | nindent 20 }}
+        {{- end }}

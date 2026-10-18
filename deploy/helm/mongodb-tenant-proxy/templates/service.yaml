@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mtp.fullname" . }}
+  labels: {{- include "mtp.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector: {{- include "mtp.selector" . | nindent 4 }}
+  ports:
+    - { name: mongo, port: {{ .Values.service.port }}, targetPort: mongo }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mtp.fullname" . }}-metrics
+  labels: {{- include "mtp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
+spec:
+  clusterIP: None
+  selector: {{- include "mtp.selector" . | nindent 4 }}
+  ports:
+    - { name: metrics, port: {{ include "mtp.port" .Values.config.metricsAddr }}, targetPort: metrics }
+{{- if and .Values.adminService.enabled .Values.config.adminAddr }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mtp.fullname" . }}-admin
+  labels: {{- include "mtp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admin
+spec:
+  type: ClusterIP
+  selector: {{- include "mtp.selector" . | nindent 4 }}
+  ports:
+    - { name: admin, port: {{ .Values.adminService.port }}, targetPort: admin }
+{{- end }}

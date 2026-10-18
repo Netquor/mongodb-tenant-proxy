@@ -21,6 +21,7 @@ func (c *conn) handleMsg(h wire.Header, body []byte) error {
 	}
 	name := rewrite.CommandName(m.Body)
 	db, _ := m.Body.Lookup("$db").StringValueOK()
+	c.beginCmd(name, db)
 	if err := rewrite.ValidateBody(m.Body); err != nil {
 		return c.reply(h, toErrorDoc(err))
 	}
@@ -49,7 +50,7 @@ func (c *conn) handleMsg(h wire.Header, body []byte) error {
 	}
 
 	if c.tenant == nil && name != "ping" {
-		c.s.M.Command(name, "denied")
+		c.cmdDeny(name, "authentication required")
 		return c.reply(h, errorDoc(13, "Unauthorized", "tenant proxy: authentication required"))
 	}
 
@@ -57,12 +58,12 @@ func (c *conn) handleMsg(h wire.Header, body []byte) error {
 		return err
 	}
 
-	res, err := c.s.rw.Rewrite(c.tenant, db, m.Body, m.Seqs)
+	res, err := c.s.rt().rw.Rewrite(c.tenant, db, m.Body, m.Seqs)
 	if err == nil && name == "listCollections" {
 		c.hookListCollections(res, m.Body, db)
 	}
 	if err != nil {
-		c.s.M.Command(name, "denied")
+		c.cmdDeny(name, err.Error())
 		c.log.Warn("command denied", "db", db, "command", name, "reason", err.Error())
 		if m.Flags&wire.FlagMoreToCome != 0 {
 			return nil
@@ -70,7 +71,7 @@ func (c *conn) handleMsg(h wire.Header, body []byte) error {
 		return c.reply(h, toErrorDoc(err))
 	}
 	if res.Reply != nil {
-		c.s.M.Command(name, "ok")
+		c.cmdDone(name, "ok")
 		return c.reply(h, res.Reply)
 	}
 	if bad := changeStreamUnsupported(res, c.s.limits.maxWire); bad != nil {
@@ -119,7 +120,7 @@ func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMore
 	}
 	if err := c.ensureUp(); err != nil {
 		c.log.Error("upstream dial failed", "err", err)
-		c.s.M.Command(res.Command, "error")
+		c.cmdDone(res.Command, "error")
 		return c.reply(h, errorDoc(6, "HostUnreachable", "tenant proxy: upstream unavailable"))
 	}
 	if !c.s.cfg.ChangeStreams.DisableAutoImages && c.s.dbWatched(res.DB) {
@@ -147,7 +148,7 @@ func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMore
 		}
 	}
 	if bad := c.runSteps(res.Before); bad != nil {
-		c.s.M.Command(res.Command, "error")
+		c.cmdDone(res.Command, "error")
 		return c.reply(h, bad)
 	}
 	out := wire.Msg{
@@ -159,7 +160,7 @@ func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMore
 		return fmt.Errorf("upstream write: %w", err)
 	}
 	if flags&wire.FlagMoreToCome != 0 {
-		c.s.M.Command(res.Command, "ok")
+		c.cmdDone(res.Command, "ok")
 		return nil // unacknowledged write: no reply
 	}
 	needParse := res.Post != nil || res.Alias != "" || len(res.After) > 0 || tracksCursor(res.Command)
@@ -178,7 +179,7 @@ func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMore
 		if len(res.After) > 0 {
 			if ok, _ := rm.Body.Lookup("ok").AsInt64OK(); ok == 1 {
 				if bad := c.runSteps(res.After); bad != nil {
-					c.s.M.Command(res.Command, "error")
+					c.cmdDone(res.Command, "error")
 					return c.reply(h, bad)
 				}
 			}
@@ -197,8 +198,8 @@ func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMore
 			c.noteIDCursor(res.Command, getMoreID, rm.Body)
 		}
 	}
-	c.s.M.Command(res.Command, "ok")
-	c.s.M.BytesOut.Add(int64(len(rb) + 16))
+	c.cmdDone(res.Command, "ok")
+	c.countOut(int64(len(rb) + 16))
 	if c.lim != nil {
 		c.lim.CountReply(len(rb) + 16)
 	}
@@ -292,12 +293,12 @@ func (c *conn) handleGetMore(h wire.Header, m *wire.Msg, db string) error {
 		return c.streamGetMore(h, m, id, sub, ns)
 	}
 	if c.tenant == nil || !ok || len(m.Seqs) > 0 || !owned || ns != db+"."+coll {
-		c.s.M.Command("getMore", "denied")
+		c.cmdDeny("getMore", "cursor not owned by connection")
 		return c.reply(h, errorDoc(43, "CursorNotFound", fmt.Sprintf("cursor id %d not found", id)))
 	}
 	res := &rewrite.Result{Command: "getMore", DB: db, Body: m.Body}
 	if c.idCursors[id] {
-		res.IDCursor, res.Post = true, c.s.rw.IDPost(c.tenant)
+		res.IDCursor, res.Post = true, c.s.rt().rw.IDPost(c.tenant)
 	}
 	if phys, isView := c.viewPhys[id]; isView {
 		res.Body, res.Alias, res.Phys = withString(m.Body, "collection", phys), coll, phys
@@ -401,8 +402,12 @@ func (c *conn) hello(req bsoncore.Document) bsoncore.Document {
 			id, err := c.s.auth.ResolveAppName(name)
 			if err == nil {
 				err = c.bindTenant(id)
+				if err == nil {
+					c.authOK()
+				}
 			}
 			if err != nil {
+				c.authFail("", "appName authentication failed")
 				c.log.Warn("appName authentication failed", "err", err)
 				return errorDoc(18, "AuthenticationFailed", "Authentication failed.")
 			}
@@ -502,12 +507,17 @@ func (c *conn) authenticated(tenant string) error {
 		}
 		return errors.New("connection is already authenticated as another tenant")
 	}
-	return c.bindTenant(tenant)
+	if err := c.bindTenant(tenant); err != nil {
+		return err
+	}
+	c.authOK()
+	return nil
 }
 
 func (c *conn) handleSASL(name string, cmd bsoncore.Document) bsoncore.Document {
 	fail := func() bsoncore.Document {
 		c.sasl = nil
+		c.authFail(c.saslUser, "invalid credentials or tenant unavailable")
 		return authFailed()
 	}
 	if len(c.s.auth.Mechanisms()) == 0 {
@@ -521,6 +531,7 @@ func (c *conn) handleSASL(name string, cmd bsoncore.Document) bsoncore.Document 
 			return c.handleOIDC(payload)
 		case auth.MechSCRAM256, auth.MechSCRAM1:
 			skip, _ := wire.LookupPath(cmd, "options", "skipEmptyExchange").BooleanOK()
+			c.saslUser = saslUser(payload)
 			var out []byte
 			var err error
 			c.sasl, out, err = c.s.auth.StartSASL(mech, payload, skip)
@@ -542,6 +553,7 @@ func (c *conn) handleSASL(name string, cmd bsoncore.Document) bsoncore.Document 
 		return fail()
 	}
 	if c.sasl.Authenticated() {
+		c.setUser(c.sasl.Username())
 		if err := c.authenticated(c.sasl.Tenant()); err != nil {
 			c.log.Warn("tenant bind failed", "err", err)
 			return fail()

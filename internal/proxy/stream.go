@@ -44,7 +44,7 @@ func (c *conn) openStream(h wire.Header, m *wire.Msg, res *rewrite.Result) (hand
 	token, err := sub.Start(fanout.Timestamp{T: t, I: i})
 	if err != nil {
 		c.log.Error("change stream fan-out failed", "err", err)
-		c.s.M.Command("aggregate", "error")
+		c.cmdDone("aggregate", "error")
 		return true, c.reply(h, errorDoc(8, "UnknownError", "tenant proxy: could not open change stream: "+err.Error()))
 	}
 	id := c.newCursorID()
@@ -54,7 +54,7 @@ func (c *conn) openStream(h wire.Header, m *wire.Msg, res *rewrite.Result) (hand
 	}
 	c.cursors[id] = ns
 	c.streams[id] = sub
-	c.s.M.Command("aggregate", "ok")
+	c.cmdDone("aggregate", "ok")
 
 	cursor := bsoncore.BuildDocument(nil,
 		bsoncore.AppendArrayElement(nil, "firstBatch", bsoncore.BuildArray(nil)),
@@ -97,7 +97,7 @@ func (c *conn) streamGetMore(h wire.Header, m *wire.Msg, id int64, sub *fanout.S
 		sub.Close()
 		delete(c.streams, id)
 		delete(c.cursors, id)
-		c.s.M.Command("getMore", "error")
+		c.cmdDone("getMore", "error")
 		return c.reply(h, resumableError(err))
 	}
 	vals := make([]bsoncore.Value, len(events))
@@ -117,7 +117,7 @@ func (c *conn) streamGetMore(h wire.Header, m *wire.Msg, id int64, sub *fanout.S
 		bsoncore.AppendInt64Element(nil, "id", cid),
 		bsoncore.AppendStringElement(nil, "ns", ns),
 	)
-	c.s.M.Command("getMore", "ok")
+	c.cmdDone("getMore", "ok")
 	return c.reply(h, bsoncore.BuildDocument(nil,
 		bsoncore.AppendDocumentElement(nil, "cursor", cursor),
 		bsoncore.AppendInt32Element(nil, "ok", 1),

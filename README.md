@@ -152,6 +152,51 @@ go build -o mongodb-tenant-proxy ./cmd/mongodb-tenant-proxy
 
 See [`proxy.example.json`](proxy.example.json). Metrics (`/metrics`, Prometheus text) and `/healthz` are served on `metricsAddr`. TLS, authentication and compression options are described above.
 
+## Operations
+
+### Hot reload
+`kill -HUP <pid>` (or `systemctl reload`, or `POST /v1/reload` on the admin API) re-reads the config file. The file is fully validated first; on any error the running config is kept and the error is logged / returned (HTTP 422). Open connections are **not** dropped.
+
+Applied live: `auth.users`, `auth.appNameSecret`, `tenants`, `databases`, `denyCommands`, `disableJS`, `disableViews`, `maxConnsPerTenant`, `idleTimeout`, `maxMessageBytes`, `logLevel`, `audit.sampleReads`. Everything else (listen address, upstream, `tenant`, `auth.mode`, `clientTLS`, `changeStreams`, `store`, `audit` sink, `metricsAddr`, `adminAddr`) needs a restart – a reload that changes them applies the rest and lists them in `restartRequired`.
+
+After every reload, and after every tenant/user change, live connections re-check their tenant: a connection whose tenant is disabled, or whose user was removed, is closed immediately (and re-checked before each subsequent command).
+
+### Tenants and the admin API
+Tenants are implicit (a user binds to a tenant id). You can also declare them in config (`tenants: [{id, disabled, maxConns}]`, read-only via the API) or create them at runtime through the admin API. Set `adminAddr` (e.g. `127.0.0.1:9103`) and authenticate with a bearer token (`admin.token`, `admin.tokenFile` or `$MTP_ADMIN_TOKEN`, ≥16 chars) and/or mTLS (`admin.tls.{certFile,keyFile,clientCAFile}`; a client certificate signed by the CA is sufficient). `/healthz` is the only unauthenticated path. Always bind the admin listener to a private interface.
+
+| Method & path | |
+|---|---|
+| `GET /v1/tenants`, `POST /v1/tenants` `{id, maxConns?, disabled?}` | list / create |
+| `GET/PATCH/DELETE /v1/tenants/{id}` | read / change `maxConns`,`disabled` / delete (kills its connections) |
+| `POST /v1/tenants/{id}/enable`, `.../disable` | disabling disconnects live clients |
+| `GET/POST /v1/tenants/{id}/users` | list / create `{username, password?}` – omit `password` to have one generated (returned once) |
+| `PUT/DELETE /v1/tenants/{id}/users/{name}` | reset password / delete (kills that user's connections) |
+| `GET /v1/connections`, `GET /v1/tenants/{id}/connections` | live connections (id, user, remote, bytes, commands, cursors, streams) |
+| `DELETE /v1/connections/{id}`, `DELETE /v1/tenants/{id}/connections` | kill one / all |
+| `GET /v1/tenants/{id}/stats` | counters per command/outcome, errors, denials, bytes, avg latency, gauges |
+| `POST /v1/reload` | hot reload |
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" -d '{"id":"acme"}' :9103/v1/tenants
+curl -H "Authorization: Bearer $TOKEN" -d '{"username":"acme-app"}' :9103/v1/tenants/acme/users   # {"password":"…"}
+```
+Users are stored as SCRAM-SHA-256 credentials only (plaintext is never persisted or logged). Users/tenants from the config file are read-only through the API (409).
+
+**Persistence** – `store.type`: `file` (default when `store.path` is set; atomic JSON file, mode 0600) or `mongo` (collections `<collection>_tenants` / `_users` in `store.database`, default `mtp_control`; `store.uri` defaults to the upstream). Use `mongo` when running several replicas; each replica re-reads the store every `store.refreshInterval` (default `30s`) so changes propagate. Authentication consults the registry on every login.
+
+### Metrics
+`/metrics` keeps the original series (`mtp_connections_*`, `mtp_client_bytes_total`, `mtp_commands_total`) and adds, labelled with `tenant`: `mtp_tenant_commands_total{command,outcome}`, `mtp_tenant_errors_total`, `mtp_tenant_denials_total`, `mtp_tenant_client_bytes_total{direction}`, `mtp_tenant_command_duration_seconds` (histogram), `mtp_tenant_connections_active`, `mtp_tenant_connections_total`, `mtp_tenant_open_cursors`, `mtp_tenant_changestream_subscribers`. Cardinality is bounded by `metrics.tenantLabel`: `mode` = `top` (default; first `topN`=50 tenants, declared ones first, get their own label, the rest are `other`), `hash` (`hashBuckets`=32 labels `b00…`), `all` (unbounded) or `off`. Per-tenant counters are tracked for at most 10 000 tenants; `GET /v1/tenants/{id}/stats` always shows the exact tenant. Span hooks: `internal/trace` calls a `Tracer` around every command when `tracing.enabled` is true; wire an OpenTelemetry tracer in with `trace.Set` (kept out of `go.mod` by default).
+
+### Audit log
+`audit.enabled` writes append-only JSON lines (one event per line) to `audit.sink`: `stdout`, `stderr`, `file` (`path`, rotated at `maxSizeMB`=100 keeping `maxBackups`=5, mode 0600), `syslog` (`syslog`: empty for local, or `udp://host:514`) or `http` (`url`, `header`; NDJSON batches, retried, never blocks the proxy). Events: `connect`, `disconnect`, `connection.killed`, `auth.success`/`auth.failure`, `command.denied` (with reason), `command.error`, `command.ddl`, `command.write`, `command.read` (sampled by `audit.sampleReads`, 0–1), `admin.action` (actor, action, target; never passwords) and `config.reload`. Each carries `session` (per connection) and `corr` (`<session>-<n>` per command, or the request id returned in `X-Correlation-Id` for admin calls), tenant, user, remote, db, command, latency. **Document contents, filter values and passwords are never logged**; denial reasons are length-limited and quoted literals are scrubbed.
+
+### Packaging
+* `make build` / `make docker` stamp `main.version/commit/date` via `-ldflags`; `mongodb-tenant-proxy version` prints them.
+* **Docker** – distroless, runs as uid 65532, `HEALTHCHECK` runs `mongodb-tenant-proxy healthcheck -config …` against `/healthz` (no shell/curl needed). State dir `/var/lib/mongodb-tenant-proxy`.
+* **docker-compose** – [`deploy/compose`](deploy/compose): mongod replica set + proxy with the admin API.
+* **systemd** – [`deploy/systemd`](deploy/systemd): hardened unit, `ExecReload` sends SIGHUP.
+* **Helm** – [`deploy/helm/mongodb-tenant-proxy`](deploy/helm/mongodb-tenant-proxy): Deployment, Service, ConfigMap/Secret (upstream password, admin token and appName secret are injected as `MTP_*` env vars), PodDisruptionBudget, HPA, ServiceMonitor and NetworkPolicy (each toggled in `values.yaml`). Use `store.type: mongo` when `replicaCount > 1`.
+
 ## Performance
 
 * Raw BSON rewriting – no struct decoding. A `find` rewrite is ≈0.85 µs / 33 allocs; stamping a 1,000-document insert is ≈125 µs.
@@ -246,7 +291,7 @@ Rejections return `code: 8000`, `codeName: "TenantQuotaExceeded"` and a message 
 ## Tests
 
 ```bash
-go test ./internal/...            # rewriter unit tests
+go test ./internal/...            # unit tests (rewriter, audit, metrics, tenants, admin, config)
 go test ./test/ -count=1          # integration: real mongod replica set + official Go driver
 go test ./test/ -bench FindOne -run xxx
 ```

@@ -1,0 +1,43 @@
+[Unit]
+Description=MongoDB tenant proxy
+Documentation=https://github.com/Netquor/mongodb-tenant-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mtproxy
+Group=mtproxy
+# Secrets (MTP_UPSTREAM_PASSWORD, MTP_ADMIN_TOKEN, MTP_APPNAME_SECRET) live here, mode 0600.
+EnvironmentFile=-/etc/mongodb-tenant-proxy/env
+ExecStart=/usr/local/bin/mongodb-tenant-proxy serve -config /etc/mongodb-tenant-proxy/proxy.json
+# SIGHUP hot-reloads the config file; an invalid file is rejected and logged.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+LimitNOFILE=65536
+TimeoutStopSec=30
+
+StateDirectory=mongodb-tenant-proxy
+LogsDirectory=mongodb-tenant-proxy
+ConfigurationDirectory=mongodb-tenant-proxy
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

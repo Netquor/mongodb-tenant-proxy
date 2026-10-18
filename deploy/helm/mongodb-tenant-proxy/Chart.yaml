@@ -1,0 +1,6 @@
+apiVersion: v2
+name: mongodb-tenant-proxy
+description: MongoDB wire-protocol proxy that confines each connection to one tenant's documents
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

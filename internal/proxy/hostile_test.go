@@ -54,9 +54,11 @@ func testConn(t *testing.T, mode string) *conn {
 		t.Fatal(err)
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := &Server{cfg: &config.Config{}, auth: a, log: log}
+	srv.run.Store(&runtime{rw: rewrite.New(rewrite.Config{})})
 	return &conn{
 		viewPhys: map[int64]string{}, cursors: map[int64]string{}, log: log,
-		s: &Server{cfg: &config.Config{}, auth: a, log: log},
+		s: srv,
 	}
 }
 
@@ -117,7 +119,7 @@ func TestSafelyContainsPanics(t *testing.T) {
 
 func TestReplyPatchersTolerateWrongTypes(t *testing.T) {
 	c := testConn(t, "static")
-	c.s.cfg.DisableViews = true
+	c.s.rt().disableViews = true
 	for _, resp := range []any{
 		bson.M{"cursor": "x", "ok": 1},
 		bson.M{"cursor": bson.A{}, "ok": 1},

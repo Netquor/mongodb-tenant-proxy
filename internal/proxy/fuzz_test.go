@@ -38,7 +38,9 @@ func FuzzReplyPatchers(f *testing.F) {
 	for _, s := range replySeeds() {
 		f.Add(s, "app.view", "collection")
 	}
-	c := &conn{viewPhys: map[int64]string{}, s: &Server{cfg: &config.Config{DisableViews: true}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}}
+	srv := &Server{cfg: &config.Config{DisableViews: true}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	srv.run.Store(&runtime{rw: rewrite.New(rewrite.Config{}), disableViews: true})
+	c := &conn{viewPhys: map[int64]string{}, s: srv}
 	c.s.views = viewCache{}
 	f.Fuzz(func(t *testing.T, resp []byte, ns, key string) {
 		// Replies come from ReadDocument, so they are exactly one document.

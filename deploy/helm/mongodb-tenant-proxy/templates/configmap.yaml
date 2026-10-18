@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mtp.fullname" . }}
+  labels: {{- include "mtp.labels" . | nindent 4 }}
+data:
+  proxy.json: |
+{{ .Values.config | toPrettyJson | indent 4 }}
