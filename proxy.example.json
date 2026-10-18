@@ -1,0 +1,26 @@
+{
+  "listen": ":27018",
+  "upstream": {
+    "uri": "mongodb://proxy-user:CHANGE_ME@mongo.internal:27017/?authSource=admin&tls=true",
+    "caFile": "/etc/ssl/mongo-ca.pem"
+  },
+  "tenant": { "field": "tenantId", "idType": "string" },
+  "databases": ["app"],
+  "auth": {
+    "mode": "scram",
+    "users": [
+      {
+        "username": "acme",
+        "tenantId": "acme",
+        "salt": "<from hash-password>",
+        "iterations": 15000,
+        "storedKey": "<from hash-password>",
+        "serverKey": "<from hash-password>"
+      }
+    ]
+  },
+  "maxConnsPerTenant": 200,
+  "idleTimeout": "10m",
+  "metricsAddr": "127.0.0.1:9102",
+  "logLevel": "info"
+}

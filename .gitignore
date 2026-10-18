@@ -1,0 +1,5 @@
+/bin/
+/mongodb-tenant-proxy
+*.test
+*.out
+proxy.json
