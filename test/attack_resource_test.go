@@ -481,3 +481,26 @@ func atkD(kv ...any) bson.D {
 	}
 	return d
 }
+
+// Change streams count against the tenant's open-cursor quota, so a tenant
+// cannot open unbounded subscribers.
+func TestAttackChangeStreamSubscribers(t *testing.T) {
+	e := atkSetup(t, func(c *config.Config) {
+		c.Tenant.Overrides = map[string]config.Limits{"tenant-cs": {MaxOpenCursors: 4}}
+	}, nil)
+	_, err := e.tenant(t, "tenant-cs").Database("atk").Collection("cs").InsertOne(ctx(t), bson.M{"x": 1})
+	must(t, err)
+	r := e.atkDialTenant(t, "tenant-cs")
+	opened := 0
+	for i := 0; i < 20; i++ {
+		res := r.cmd("atk", atkD("aggregate", "cs", "cursor", atkD(), "pipeline", bson.A{atkD("$changeStream", atkD())}))
+		if isOK(res) {
+			opened++
+		}
+	}
+	if opened == 0 || opened > 4 {
+		t.Fatalf("opened %d change streams with a quota of 4", opened)
+	}
+	e.noPanics(t)
+	e.alive(t, "tenant-other")
+}

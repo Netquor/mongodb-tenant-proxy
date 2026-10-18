@@ -37,6 +37,7 @@ their share of capacity, or the upstream credentials.
 | Use JavaScript to burn CPU or escape the filter | `disableJS` refuses every JS entry point (`$where`, `$function`, `$accumulator`, `mapReduce`, in any position) | `TestAttackExpensiveOperators` |
 | Starve other tenants | Per-tenant ops/bytes rate, in-flight cap, cursor cap, index cap, connection cap; pooled upstream connections are borrowed per command | `TestAttackNoisyNeighbour`, `TestAttackCursorFlood`, `TestAttackSessionsViewsIndexes`, `TestAttackConnectionCaps` |
 | Open unbounded cursors | 10 000 cursors per connection (refused before the cursor exists, so none are leaked upstream) plus the per-tenant `maxOpenCursors` quota; all are killed when the connection ends | `TestAttackCursorFlood` |
+| Open unbounded change streams | Streams count against `maxOpenCursors` | `TestAttackChangeStreamSubscribers` |
 | Pin memory with a stalled change-stream subscriber | Subscriber queue is capped by count **and** bytes (64 MiB); an overflowed subscriber is resumed privately by the driver | `internal/fanout/attack_test.go` |
 | Pathological commands (deep nesting, 50k stages, 800k-element `$in`, 300k-key filters) | BSON depth ≤ 100, message size cap, `maxTimeMS` default/cap per tenant; the rewrite is linear (measured in `TestAttackHugeCommands`) | `TestAttackHugeCommands`, `internal/rewrite/adversarial_test.go` |
 | ReDoS / slow operators | `defaultMaxTimeMS` and `maxTimeMSCap` apply to every command. mongod enforces them for regexes, `$lookup` and `$where` | `TestAttackExpensiveOperators` |
