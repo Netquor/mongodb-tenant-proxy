@@ -342,9 +342,18 @@ func (r *Rewriter) rewriteChangeStream(t *Tenant, spec value) ([]value, error) {
 	out = bsoncore.AppendStringElement(out, "fullDocumentBeforeChange", "required")
 	stages := []value{docValue(buildDoc(bsoncore.AppendDocumentElement(nil, "$changeStream", finishDoc(out))))}
 
+	lifecycle := arrayOf(
+		value{Type: bsoncore.TypeString, Data: bsoncore.AppendString(nil, "drop")},
+		value{Type: bsoncore.TypeString, Data: bsoncore.AppendString(nil, "rename")},
+		value{Type: bsoncore.TypeString, Data: bsoncore.AppendString(nil, "dropDatabase")},
+		value{Type: bsoncore.TypeString, Data: bsoncore.AppendString(nil, "invalidate")},
+	)
 	match := arrayOf(
 		docValue(buildDoc(valElem("fullDocument."+r.field, t.Value))),
 		docValue(buildDoc(valElem("fullDocumentBeforeChange."+r.field, t.Value))),
+		// Lifecycle events hold no document data and apply to every tenant.
+		docValue(buildDoc(bsoncore.AppendDocumentElement(nil, "operationType",
+			buildDoc(bsoncore.AppendArrayElement(nil, "$in", lifecycle))))),
 	)
 	stages = append(stages, docValue(buildDoc(bsoncore.AppendDocumentElement(nil, "$match",
 		buildDoc(bsoncore.AppendArrayElement(nil, "$or", match))))))

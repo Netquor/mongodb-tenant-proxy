@@ -14,6 +14,7 @@ import (
 
 	"github.com/netquor/mongodb-tenant-proxy/internal/auth"
 	"github.com/netquor/mongodb-tenant-proxy/internal/config"
+	"github.com/netquor/mongodb-tenant-proxy/internal/fanout"
 	"github.com/netquor/mongodb-tenant-proxy/internal/metrics"
 	"github.com/netquor/mongodb-tenant-proxy/internal/rewrite"
 	"github.com/netquor/mongodb-tenant-proxy/internal/upstream"
@@ -35,7 +36,7 @@ type Server struct {
 	conns  map[*conn]struct{}
 	tenant map[string]int
 	wg     sync.WaitGroup
-	images sync.Map // "db.coll" -> struct{}: pre/post images known to be on
+	fan    *fanout.Manager
 }
 
 type helloLimits struct {
@@ -65,8 +66,11 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 			Databases:     cfg.Databases,
 			DenyCommands:  cfg.DenyCommands,
 			AllowJS:       cfg.AllowJS,
-			ChangeStreams: cfg.ChangeStreams.Enabled,
+			ChangeStreams: !cfg.ChangeStreams.Disabled,
 		}),
+	}
+	if cs := cfg.ChangeStreams; !cs.Disabled && !cs.DisableFanout {
+		s.fan = fanout.NewManager(d, cfg.Tenant.Field, !cs.DisableAutoImages, cfg.MaxMessageBytes, log)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

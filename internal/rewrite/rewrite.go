@@ -134,8 +134,13 @@ type Result struct {
 	// makes sure pre/post images are enabled on the collection first.
 	ChangeStream bool
 	Collection   string
-	Body         bsoncore.Document
-	Seqs         []wire.Seq
+	// Stream is set when the change stream can be served from a shared
+	// upstream stream (fresh start, no custom stages beyond a simple
+	// operationType $match). Otherwise the rewritten Body is a private,
+	// server-filtered stream.
+	Stream *StreamSpec
+	Body   bsoncore.Document
+	Seqs   []wire.Seq
 	// Reply, when non-nil, is sent to the client without contacting the
 	// upstream server.
 	Reply bsoncore.Document
@@ -369,6 +374,7 @@ func (r *Rewriter) cmdAggregate(q *request) (*Result, error) {
 			if e, err := d.IndexErr(0); err == nil && e.Key() == "$changeStream" {
 				res.ChangeStream = true
 				res.Collection, _ = r.collection(q)
+				res.Stream = streamSpec(q)
 			}
 		}
 	}

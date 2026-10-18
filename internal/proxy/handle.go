@@ -52,24 +52,37 @@ func (c *conn) handleMsg(h wire.Header, body []byte) error {
 		c.s.M.Command(name, "ok")
 		return c.reply(h, res.Reply)
 	}
+	if res.Stream != nil && c.s.fan != nil {
+		if handled, err := c.openStream(h, m, res); handled || err != nil {
+			return err
+		}
+	}
 	return c.forward(h, m.Flags, res, 0)
+}
+
+func (c *conn) ensureUp() error {
+	if c.up != nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), c.s.cfg.DialDuration())
+	defer cancel()
+	up, err := c.s.dial.Dial(ctx)
+	if err != nil {
+		return err
+	}
+	c.up = up
+	return nil
 }
 
 // forward sends a rewritten command upstream and relays the reply.
 func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMoreID int64) error {
-	if c.up == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), c.s.cfg.DialDuration())
-		up, err := c.s.dial.Dial(ctx)
-		cancel()
-		if err != nil {
-			c.log.Error("upstream dial failed", "err", err)
-			c.s.M.Command(res.Command, "error")
-			return c.reply(h, errorDoc(6, "HostUnreachable", "tenant proxy: upstream unavailable"))
-		}
-		c.up = up
+	if err := c.ensureUp(); err != nil {
+		c.log.Error("upstream dial failed", "err", err)
+		c.s.M.Command(res.Command, "error")
+		return c.reply(h, errorDoc(6, "HostUnreachable", "tenant proxy: upstream unavailable"))
 	}
-	if res.ChangeStream && c.s.cfg.ChangeStreams.AutoEnableImages {
-		if err := c.ensureImages(res.DB, res.Collection); err != nil {
+	if res.ChangeStream && !c.s.cfg.ChangeStreams.DisableAutoImages {
+		if err := c.s.dial.EnsureImages(c.up, res.DB, res.Collection); err != nil {
 			c.log.Error("enabling change stream images failed", "err", err)
 			return c.reply(h, errorDoc(8, "UnknownError", "tenant proxy: could not enable change stream images: "+err.Error()))
 		}
@@ -147,6 +160,9 @@ func (c *conn) handleGetMore(h wire.Header, m *wire.Msg, db string) error {
 	id, ok := m.Body.Lookup("getMore").AsInt64OK()
 	coll, _ := m.Body.Lookup("collection").StringValueOK()
 	ns, owned := c.cursors[id]
+	if sub, virtual := c.streams[id]; virtual && c.tenant != nil && ok && owned && ns == db+"."+coll {
+		return c.streamGetMore(h, m, id, sub, ns)
+	}
 	if c.tenant == nil || !ok || len(m.Seqs) > 0 || !owned || ns != db+"."+coll {
 		c.s.M.Command("getMore", "denied")
 		return c.reply(h, errorDoc(43, "CursorNotFound", fmt.Sprintf("cursor id %d not found", id)))
@@ -163,8 +179,16 @@ func (c *conn) handleKillCursors(h wire.Header, m *wire.Msg, db string) error {
 	vals, _ := arr.Values()
 	var owned, missing []bsoncore.Value
 	var ownedIDs []int64
+	var virtualKilled []bsoncore.Value
 	for _, v := range vals {
 		id, ok := v.AsInt64OK()
+		if sub, virtual := c.streams[id]; virtual && ok && c.cursors[id] == db+"."+coll {
+			sub.Close()
+			delete(c.streams, id)
+			delete(c.cursors, id)
+			virtualKilled = append(virtualKilled, v)
+			continue
+		}
 		if ns, has := c.cursors[id]; ok && has && ns == db+"."+coll {
 			owned = append(owned, v)
 			ownedIDs = append(ownedIDs, id)
@@ -174,7 +198,7 @@ func (c *conn) handleKillCursors(h wire.Header, m *wire.Msg, db string) error {
 	}
 	if len(owned) == 0 {
 		return c.reply(h, bsoncore.BuildDocument(nil,
-			bsoncore.AppendArrayElement(nil, "cursorsKilled", bsoncore.BuildArray(nil)),
+			bsoncore.AppendArrayElement(nil, "cursorsKilled", bsoncore.BuildArray(nil, virtualKilled...)),
 			bsoncore.AppendArrayElement(nil, "cursorsNotFound", bsoncore.BuildArray(nil, missing...)),
 			bsoncore.AppendArrayElement(nil, "cursorsAlive", bsoncore.BuildArray(nil)),
 			bsoncore.AppendArrayElement(nil, "cursorsUnknown", bsoncore.BuildArray(nil)),
@@ -330,41 +354,4 @@ func (c *conn) handleSASL(name string, cmd bsoncore.Document) bsoncore.Document 
 		bsoncore.AppendBinaryElement(nil, "payload", 0, out),
 		bsoncore.AppendInt32Element(nil, "ok", 1),
 	)
-}
-
-// ensureImages turns on pre/post images for a collection (once per process),
-// creating the collection if it does not exist yet.
-func (c *conn) ensureImages(db, coll string) error {
-	ns := db + "." + coll
-	if _, ok := c.s.images.Load(ns); ok {
-		return nil
-	}
-	on := bsoncore.BuildDocument(nil, bsoncore.AppendBooleanElement(nil, "enabled", true))
-	run := func(cmd bsoncore.Document) (bsoncore.Document, error) { return c.s.dial.RunCommand(c.up, db, cmd) }
-	resp, err := run(bsoncore.BuildDocument(nil,
-		bsoncore.AppendStringElement(nil, "collMod", coll),
-		bsoncore.AppendDocumentElement(nil, "changeStreamPreAndPostImages", on)))
-	if err != nil {
-		return err
-	}
-	if ok, _ := resp.Lookup("ok").AsInt64OK(); ok != 1 {
-		if code, _ := resp.Lookup("code").AsInt64OK(); code != 26 { // NamespaceNotFound
-			msg, _ := resp.Lookup("errmsg").StringValueOK()
-			return errors.New(msg)
-		}
-		resp, err = run(bsoncore.BuildDocument(nil,
-			bsoncore.AppendStringElement(nil, "create", coll),
-			bsoncore.AppendDocumentElement(nil, "changeStreamPreAndPostImages", on)))
-		if err != nil {
-			return err
-		}
-		if ok, _ := resp.Lookup("ok").AsInt64OK(); ok != 1 {
-			if code, _ := resp.Lookup("code").AsInt64OK(); code != 48 { // already exists (race)
-				msg, _ := resp.Lookup("errmsg").StringValueOK()
-				return errors.New(msg)
-			}
-		}
-	}
-	c.s.images.Store(ns, struct{}{})
-	return nil
 }

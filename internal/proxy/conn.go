@@ -12,6 +12,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 
 	"github.com/netquor/mongodb-tenant-proxy/internal/auth"
+	"github.com/netquor/mongodb-tenant-proxy/internal/fanout"
 	"github.com/netquor/mongodb-tenant-proxy/internal/rewrite"
 	"github.com/netquor/mongodb-tenant-proxy/internal/upstream"
 	"github.com/netquor/mongodb-tenant-proxy/internal/wire"
@@ -33,7 +34,8 @@ type conn struct {
 	sasl       *auth.SASL
 
 	up      *upstream.Conn
-	cursors map[int64]string // cursor id -> namespace it was opened on
+	cursors map[int64]string      // cursor id -> namespace it was opened on
+	streams map[int64]*fanout.Sub // virtual change stream cursors served by the fan-out
 	outID   int32
 }
 
@@ -43,6 +45,7 @@ func newConn(s *Server, nc net.Conn) *conn {
 		s: s, nc: nc, id: id,
 		br:      bufio.NewReaderSize(nc, 64*1024),
 		cursors: map[int64]string{},
+		streams: map[int64]*fanout.Sub{},
 		log:     s.log.With("conn", id, "remote", nc.RemoteAddr().String()),
 	}
 }
@@ -90,6 +93,9 @@ func (c *conn) serve(ctx context.Context) {
 }
 
 func (c *conn) cleanup() {
+	for _, sub := range c.streams {
+		sub.Close()
+	}
 	if c.up != nil {
 		c.killOpenCursors()
 		c.up.Close()
@@ -104,6 +110,9 @@ func (c *conn) cleanup() {
 func (c *conn) killOpenCursors() {
 	byNS := map[string][]int64{}
 	for id, ns := range c.cursors {
+		if _, virtual := c.streams[id]; virtual {
+			continue
+		}
 		byNS[ns] = append(byNS[ns], id)
 	}
 	c.up.SetDeadline(time.Now().Add(2 * time.Second))

@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/xdg-go/scram"
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
@@ -28,11 +30,12 @@ type Conn struct {
 
 // Dialer opens upstream connections.
 type Dialer struct {
-	cfg  config.Upstream
-	dial net.Dialer
-	tls  *tls.Config
-	max  int
-	ids  atomic.Int32
+	cfg    config.Upstream
+	dial   net.Dialer
+	tls    *tls.Config
+	max    int
+	ids    atomic.Int32
+	images sync.Map // "db.coll" -> struct{}
 }
 
 // NewDialer prepares a Dialer from the upstream configuration.
@@ -185,3 +188,42 @@ func (d *Dialer) authenticate(c *Conn) error {
 }
 
 func valueElem(key string, v bsoncore.Value) []byte { return bsoncore.AppendValueElement(nil, key, v) }
+
+// DialTimeout is the configured connect timeout.
+func (d *Dialer) DialTimeout() time.Duration { return d.dial.Timeout }
+
+// EnsureImages enables changeStreamPreAndPostImages on a collection (creating
+// it if it does not exist). It is idempotent.
+func (d *Dialer) EnsureImages(c *Conn, db, coll string) error {
+	if _, ok := d.images.Load(db + "." + coll); ok {
+		return nil
+	}
+	on := bsoncore.BuildDocument(nil, bsoncore.AppendBooleanElement(nil, "enabled", true))
+	run := func(cmd bsoncore.Document) (bsoncore.Document, error) { return d.RunCommand(c, db, cmd) }
+	resp, err := run(bsoncore.BuildDocument(nil,
+		bsoncore.AppendStringElement(nil, "collMod", coll),
+		bsoncore.AppendDocumentElement(nil, "changeStreamPreAndPostImages", on)))
+	if err != nil {
+		return err
+	}
+	if ok, _ := resp.Lookup("ok").AsInt64OK(); ok != 1 {
+		if code, _ := resp.Lookup("code").AsInt64OK(); code != 26 { // NamespaceNotFound
+			msg, _ := resp.Lookup("errmsg").StringValueOK()
+			return errors.New(msg)
+		}
+		resp, err = run(bsoncore.BuildDocument(nil,
+			bsoncore.AppendStringElement(nil, "create", coll),
+			bsoncore.AppendDocumentElement(nil, "changeStreamPreAndPostImages", on)))
+		if err != nil {
+			return err
+		}
+		if ok, _ := resp.Lookup("ok").AsInt64OK(); ok != 1 {
+			if code, _ := resp.Lookup("code").AsInt64OK(); code != 48 { // already exists (race)
+				msg, _ := resp.Lookup("errmsg").StringValueOK()
+				return errors.New(msg)
+			}
+		}
+	}
+	d.images.Store(db+"."+coll, struct{}{})
+	return nil
+}

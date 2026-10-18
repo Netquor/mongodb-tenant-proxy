@@ -36,14 +36,20 @@ type Config struct {
 	LogLevel          string `json:"logLevel,omitempty"`
 }
 
-// ChangeStreams configures change stream support. Streams are filtered using
-// collection pre/post images (MongoDB 6.0+), which cost oplog/storage on
-// the collections concerned.
+// ChangeStreams configures change stream support, which is on by default.
+//
+// Events are filtered per tenant using collection pre/post images
+// (MongoDB 6.0+). Streams that start fresh with no custom stages share one
+// upstream stream per collection and are routed by the proxy; everything else
+// (resume tokens, custom stages) runs as a private, server-filtered stream.
 type ChangeStreams struct {
-	Enabled bool `json:"enabled,omitempty"`
-	// AutoEnableImages lets the proxy turn on changeStreamPreAndPostImages
-	// (using its upstream credentials) the first time a collection is watched.
-	AutoEnableImages bool `json:"autoEnableImages,omitempty"`
+	// Disabled turns change streams off entirely.
+	Disabled bool `json:"disabled,omitempty"`
+	// DisableAutoImages stops the proxy from enabling changeStreamPreAndPostImages
+	// (with its upstream credentials) the first time a collection is watched.
+	DisableAutoImages bool `json:"disableAutoImages,omitempty"`
+	// DisableFanout makes every stream a private server-side stream.
+	DisableFanout bool `json:"disableFanout,omitempty"`
 }
 
 // ClientTLS configures the listener's TLS.

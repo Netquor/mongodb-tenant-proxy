@@ -36,9 +36,15 @@ The proxy authenticates to MongoDB itself (SCRAM-SHA-256, optional TLS) and pres
 
 ## Change streams
 
-Enable with `"changeStreams": {"enabled": true, "autoEnableImages": true}` (MongoDB 6.0+). Delete and update events don't contain the tenant field, so the proxy forces `fullDocument`/`fullDocumentBeforeChange: "required"` (collection pre/post images), puts a `$match` on those images directly after `$changeStream` (before any client stage), and strips the images again unless the client asked for them. A tenant therefore only ever receives its own events, with no per-event lookups and no proxy-side state. `autoEnableImages` lets the proxy run `collMod` with its own credentials the first time a collection is watched; otherwise enable `changeStreamPreAndPostImages` yourself.
+On by default (MongoDB 6.0+), collection level. Tenants get the stream a real server would give them, filtered to their own documents:
 
-Trade-offs: pre/post images add oplog/storage cost on watched collections; filtering is server-side, so each open stream still scans the shared oplog (cost grows with watchers). Database- and cluster-level streams are refused, and drop/rename/invalidate events are not delivered to tenants.
+* **Shared fan-out.** A fresh stream (optionally with `fullDocument`, `fullDocumentBeforeChange` and a `$match` on `operationType`) is served from **one upstream change stream per collection**. The proxy routes each event to the subscribers of the tenant that owns it, so 40 watchers across 5 tenants cost 1 upstream cursor and one oplog scan instead of 40. Streams are anchored at the cluster's operation time when opened, resume tokens are the real ones, and each subscriber has a bounded buffer; one that falls behind gets a resumable error and the driver resumes it privately.
+* **Private server-side stream.** Anything else (`resumeAfter`/`startAfter`/`startAtOperationTime`, `$project` and other stages, `showExpandedEvents`) runs as a normal change stream with a `$match` placed directly after `$changeStream`, so client stages never see other tenants' events.
+* **Tenant on every event.** Updates and deletes don't carry `tenantId`, so the proxy forces `fullDocument`/`fullDocumentBeforeChange: "required"` (collection pre/post images) and removes them again unless the client asked. The proxy enables `changeStreamPreAndPostImages` itself the first time a collection is watched (disable with `changeStreams.disableAutoImages`).
+* **Lifecycle events** (`drop`, `rename`, `dropDatabase`, `invalidate`) carry no document data and are delivered to every watcher of the collection, closing the stream after `invalidate`, as on a real server.
+* Database- and cluster-level streams are refused. Config: `changeStreams.{disabled, disableAutoImages, disableFanout}`.
+
+Cost: pre/post images add oplog/storage on watched collections.
 
 ## Run
 
