@@ -204,12 +204,10 @@ func TestTenantIsolation(t *testing.T) {
 	t.Run("disallowed operations", func(t *testing.T) {
 		db := a.Database("app")
 		for name, cmd := range map[string]bson.D{
-			"dropDatabase":     {{Key: "dropDatabase", Value: 1}},
-			"renameCollection": {{Key: "renameCollection", Value: "app.items"}, {Key: "to", Value: "app.x"}},
-			"collStats":        {{Key: "collStats", Value: "items"}},
-			"serverStatus":     {{Key: "serverStatus", Value: 1}},
-			"currentOp":        {{Key: "currentOp", Value: 1}},
-			"mapReduce":        {{Key: "mapReduce", Value: "items"}},
+			"validate":   {{Key: "validate", Value: "items"}},
+			"createUser": {{Key: "createUser", Value: "x"}, {Key: "pwd", Value: "y"}, {Key: "roles", Value: bson.A{}}},
+			"shutdown":   {{Key: "shutdown", Value: 1}},
+			"mapReduce":  {{Key: "mapReduce", Value: "items"}},
 		} {
 			mustFail(t, db.RunCommand(ctx(t), cmd).Err(), name)
 		}
@@ -372,7 +370,7 @@ func TestAggregationIsolation(t *testing.T) {
 	t.Run("dangerous stages are refused", func(t *testing.T) {
 		for _, st := range []bson.D{
 			{{Key: "$currentOp", Value: bson.M{}}},
-			{{Key: "$collStats", Value: bson.M{"count": bson.M{}}}},
+			{{Key: "$collStats", Value: bson.M{"latencyStats": bson.M{}}}},
 			{{Key: "$indexStats", Value: bson.M{}}},
 			{{Key: "$listSessions", Value: bson.M{}}},
 		} {

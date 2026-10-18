@@ -5,8 +5,15 @@
     "caFile": "/etc/ssl/mongo-ca.pem",
     "pool": { "mode": "pooled", "maxSize": 100, "idleTimeout": "5m" }
   },
-  "tenant": { "field": "tenantId", "idType": "string" },
+  "tenant": {
+    "field": "tenantId",
+    "idType": "string",
+    "idPolicy": "require-generated",
+    "limits": { "opsPerSec": 500, "maxOpenCursors": 100, "maxTimeMSCap": 60000, "defaultMaxTimeMS": 30000 },
+    "overrides": { "acme": { "opsPerSec": 5000 } }
+  },
   "databases": ["app"],
+  "compressors": ["zstd", "snappy", "zlib"],
   "auth": {
     "mode": "scram",
     "users": [
@@ -23,5 +30,27 @@
   "maxConnsPerTenant": 200,
   "idleTimeout": "10m",
   "metricsAddr": "127.0.0.1:9102",
-  "logLevel": "info"
+  "logLevel": "info",
+  "adminAddr": "127.0.0.1:9103",
+  "admin": {
+    "tokenFile": "/etc/mongodb-tenant-proxy/admin-token"
+  },
+  "store": {
+    "type": "file",
+    "path": "/var/lib/mongodb-tenant-proxy/tenants.json"
+  },
+  "metrics": {
+    "tenantLabel": {
+      "mode": "top",
+      "topN": 50
+    }
+  },
+  "audit": {
+    "enabled": true,
+    "sink": "file",
+    "path": "/var/log/mongodb-tenant-proxy/audit.log",
+    "maxSizeMB": 100,
+    "maxBackups": 5,
+    "sampleReads": 0.01
+  }
 }

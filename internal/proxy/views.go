@@ -70,7 +70,7 @@ func (c *conn) viewsIn(db string) (map[string]*viewDef, error) {
 		return nil, err
 	}
 	out := map[string]*viewDef{}
-	if batch, ok := resp.Lookup("cursor", "firstBatch").ArrayOK(); ok {
+	if batch, ok := wire.LookupPath(resp, "cursor", "firstBatch").ArrayOK(); ok {
 		vals, _ := batch.Values()
 		for _, v := range vals {
 			d, ok := v.DocumentOK()
@@ -101,7 +101,7 @@ var viewWriteCmds = map[string]bool{"insert": true, "update": true, "delete": tr
 // create, drop or modify one). handled is false when the command is not
 // view-related and should take the normal path.
 func (c *conn) maybeView(h wire.Header, m *wire.Msg, name, db string) (handled bool, err error) {
-	if c.s.cfg.DisableViews {
+	if c.s.rt().disableViews {
 		return false, nil
 	}
 	switch {
@@ -113,10 +113,24 @@ func (c *conn) maybeView(h wire.Header, m *wire.Msg, name, db string) (handled b
 	if !ok {
 		return false, nil
 	}
-	if name == "collMod" || (name == "create" && m.Body.Lookup("viewOn").Type != 0) {
+	if name == "collMod" {
+		// collMod on a collection (validators) is handled by the rewriter.
+		if !c.s.rt().rw.AllowedDB(db) || c.s.rt().rw.Denied(name) {
+			return false, nil
+		}
+		views, verr := c.viewsIn(db)
+		if verr != nil {
+			return true, c.reply(h, errorDoc(6, "HostUnreachable", "tenant proxy: upstream unavailable"))
+		}
+		if views[coll] == nil {
+			return false, nil
+		}
 		return true, c.viewDDL(h, m, name, db, coll)
 	}
-	if !c.s.rw.AllowedDB(db) || c.s.rw.Denied(name) {
+	if name == "create" && m.Body.Lookup("viewOn").Type != 0 {
+		return true, c.viewDDL(h, m, name, db, coll)
+	}
+	if !c.s.rt().rw.AllowedDB(db) || c.s.rt().rw.Denied(name) {
 		return false, nil // let the normal path produce the right error
 	}
 	views, verr := c.viewsIn(db)
@@ -133,9 +147,9 @@ func (c *conn) maybeView(h wire.Header, m *wire.Msg, name, db string) (handled b
 	case name == "drop":
 		return true, c.dropView(h, db, def)
 	case viewReadCmds[name]:
-		res, err := c.s.rw.RewriteView(c.tenant, db, m.Body, m.Seqs, def.Phys)
+		res, err := c.s.rt().rw.RewriteView(c.tenant, db, m.Body, m.Seqs, def.Phys)
 		if err != nil {
-			c.s.M.Command(name, "denied")
+			c.cmdDeny(name, err.Error())
 			return true, c.reply(h, toErrorDoc(err))
 		}
 		res.Alias, res.Phys = coll, def.Phys
@@ -160,7 +174,7 @@ func failed(resp bsoncore.Document) bool {
 // viewDDL handles create (with viewOn) and collMod on a view.
 func (c *conn) viewDDL(h wire.Header, m *wire.Msg, name, db, coll string) error {
 	fail := func(err error) error { return c.reply(h, toErrorDoc(err)) }
-	if !c.s.rw.AllowedDB(db) || c.s.rw.Denied(name) {
+	if !c.s.rt().rw.AllowedDB(db) || c.s.rt().rw.Denied(name) {
 		return c.reply(h, errorDoc(13, "Unauthorized", "tenant proxy: command not allowed"))
 	}
 	if err := rewrite.CheckCollName(coll); err != nil {
@@ -205,7 +219,7 @@ func (c *conn) viewDDL(h wire.Header, m *wire.Msg, name, db, coll string) error 
 	} else if err := rewrite.CheckCollName(viewOn); err != nil {
 		return fail(err)
 	}
-	scoped, err := c.s.rw.ScopeViewPipeline(c.tenant, pipeline, inject)
+	scoped, err := c.s.rt().rw.ScopeViewPipeline(c.tenant, pipeline, inject)
 	if err != nil {
 		return fail(err)
 	}
@@ -219,7 +233,7 @@ func (c *conn) viewDDL(h wire.Header, m *wire.Msg, name, db, coll string) error 
 			bsoncore.AppendInt32Element(nil, "limit", 1),
 			bsoncore.AppendBooleanElement(nil, "singleBatch", true)))
 		if err == nil && !failed(probe) {
-			if b, _ := probe.Lookup("cursor", "firstBatch").ArrayOK(); b != nil {
+			if b, _ := wire.LookupPath(probe, "cursor", "firstBatch").ArrayOK(); b != nil {
 				if vals, _ := b.Values(); len(vals) > 0 {
 					return c.reply(h, errorDoc(48, "NamespaceExists", "Collection already exists. NS: "+db+"."+coll))
 				}
@@ -230,6 +244,9 @@ func (c *conn) viewDDL(h wire.Header, m *wire.Msg, name, db, coll string) error 
 			bsoncore.AppendStringElement(nil, "viewOn", physOn),
 			bsoncore.AppendArrayElement(nil, "pipeline", scoped))
 		if col := m.Body.Lookup("collation"); col.Type != 0 {
+			if err := rewrite.CheckCollation(col); err != nil {
+				return fail(err)
+			}
 			cmd = appendRaw(cmd, valueElem("collation", col))
 		}
 		if resp, err := c.run(db, cmd); err != nil || failed(resp) {
@@ -266,7 +283,7 @@ func (c *conn) viewDDL(h wire.Header, m *wire.Msg, name, db, coll string) error 
 		return c.relay(h, resp, err)
 	}
 	c.invalidateViews(db)
-	c.s.M.Command(name, "ok")
+	c.cmdDone(name, "ok")
 	return c.reply(h, okDoc())
 }
 
@@ -283,7 +300,7 @@ func (c *conn) dropView(h wire.Header, db string, def *viewDef) error {
 		return c.relay(h, resp, err)
 	}
 	c.invalidateViews(db)
-	c.s.M.Command("drop", "ok")
+	c.cmdDone("drop", "ok")
 	return c.reply(h, bsoncore.BuildDocument(nil,
 		bsoncore.AppendStringElement(nil, "ns", db+"."+def.Name),
 		bsoncore.AppendInt32Element(nil, "ok", 1)))
@@ -365,7 +382,7 @@ func (c *conn) noteViewCursor(resp bsoncore.Document, phys string, getMoreID int
 	if getMoreID != 0 {
 		return
 	}
-	if id, _ := resp.Lookup("cursor", "id").AsInt64OK(); id != 0 {
+	if id, _ := wire.LookupPath(resp, "cursor", "id").AsInt64OK(); id != 0 {
 		c.viewPhys[id] = phys
 	}
 }
@@ -375,7 +392,7 @@ func (c *conn) noteViewCursor(resp bsoncore.Document, phys string, getMoreID int
 // hookListCollections hides internal collections and lists the tenant's views.
 func (c *conn) hookListCollections(res *rewrite.Result, body bsoncore.Document, db string) {
 	var views map[string]*viewDef
-	if !c.s.cfg.DisableViews {
+	if !c.s.rt().disableViews {
 		views, _ = c.viewsIn(db)
 	}
 	nameOnly, _ := body.Lookup("nameOnly").BooleanOK()
@@ -386,6 +403,7 @@ func (c *conn) hookListCollections(res *rewrite.Result, body bsoncore.Document, 
 			views = nil
 		}
 	}
+	validators := c.validatorsIn(db)
 	res.Post = func(resp bsoncore.Document) bsoncore.Document {
 		cur, ok := resp.Lookup("cursor").DocumentOK()
 		if !ok {
@@ -399,10 +417,11 @@ func (c *conn) hookListCollections(res *rewrite.Result, body bsoncore.Document, 
 			if !ok {
 				continue
 			}
-			if n, _ := d.Lookup("name").StringValueOK(); strings.HasPrefix(n, "__mtp_") {
+			n, _ := d.Lookup("name").StringValueOK()
+			if strings.HasPrefix(n, "__mtp_") {
 				continue
 			}
-			keep = append(keep, v)
+			keep = append(keep, bsoncore.Value{Type: bsoncore.TypeEmbeddedDocument, Data: c.ownValidator(d, n, validators)})
 		}
 		for name, def := range views {
 			if filterName != "" && filterName != name {
@@ -445,4 +464,64 @@ func patchTop(d bsoncore.Document, key string, v bsoncore.Value) bsoncore.Docume
 	n := len(out)
 	out[0], out[1], out[2], out[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
 	return out
+}
+
+// validatorsIn returns the tenant's own collMod validators in db by collection.
+func (c *conn) validatorsIn(db string) map[string]bsoncore.Document {
+	out := map[string]bsoncore.Document{}
+	if c.tenant == nil {
+		return out
+	}
+	resp, err := c.run(db, bsoncore.BuildDocument(nil,
+		bsoncore.AppendStringElement(nil, "find", rewrite.ValidatorsColl),
+		bsoncore.AppendDocumentElement(nil, "filter", bsoncore.BuildDocument(nil, valueElem(c.s.cfg.Tenant.Field, c.tenant.Value))),
+		bsoncore.AppendInt32Element(nil, "batchSize", 100000),
+		bsoncore.AppendBooleanElement(nil, "singleBatch", true)))
+	if err != nil || failed(resp) {
+		return out
+	}
+	if batch, ok := resp.Lookup("cursor", "firstBatch").ArrayOK(); ok {
+		vals, _ := batch.Values()
+		for _, v := range vals {
+			d, ok := v.DocumentOK()
+			if !ok {
+				continue
+			}
+			coll, _ := d.Lookup("coll").StringValueOK()
+			if vd, ok := d.Lookup("validator").DocumentOK(); ok && coll != "" {
+				out[coll] = vd
+			}
+		}
+	}
+	return out
+}
+
+// ownValidator replaces the collection's physical validator, which combines
+// every tenant's, with the tenant's own (or none).
+func (c *conn) ownValidator(entry bsoncore.Document, name string, own map[string]bsoncore.Document) bsoncore.Document {
+	opts, ok := entry.Lookup("options").DocumentOK()
+	if !ok {
+		return entry
+	}
+	els, err := opts.Elements()
+	if err != nil {
+		return entry
+	}
+	no := make([]byte, 4)
+	for _, e := range els {
+		switch e.Key() {
+		case "validator", "validationLevel", "validationAction":
+		default:
+			no = append(no, e...)
+		}
+	}
+	if v, ok := own[name]; ok {
+		no = bsoncore.AppendDocumentElement(no, "validator", v)
+		no = bsoncore.AppendStringElement(no, "validationLevel", "strict")
+		no = bsoncore.AppendStringElement(no, "validationAction", "error")
+	}
+	no = append(no, 0)
+	n := len(no)
+	no[0], no[1], no[2], no[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	return patchTop(entry, "options", bsoncore.Value{Type: bsoncore.TypeEmbeddedDocument, Data: no})
 }

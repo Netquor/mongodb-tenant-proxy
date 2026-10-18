@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("0000\xffcursor\x00\f\x00000\x9b")
+string("0")
+string("0")

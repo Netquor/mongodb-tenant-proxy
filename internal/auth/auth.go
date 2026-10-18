@@ -3,6 +3,7 @@ package auth
 
 import (
 	"crypto/hmac"
+	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -10,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/xdg-go/scram"
 
@@ -19,70 +22,249 @@ import (
 // ErrAuthFailed is returned for any authentication failure.
 var ErrAuthFailed = errors.New("Authentication failed.")
 
+// SASL mechanism names.
+const (
+	MechSCRAM256 = "SCRAM-SHA-256"
+	MechSCRAM1   = "SCRAM-SHA-1"
+	MechX509     = "MONGODB-X509"
+	MechOIDC     = "MONGODB-OIDC"
+)
+
 // Authenticator holds credentials and tenant-resolution rules.
 type Authenticator struct {
-	mode   string
-	static string
-	secret []byte
-	users  map[string]*user
-	server *scram.Server
+	mode     string
+	modes    config.Mode
+	static   string
+	secretMu sync.RWMutex
+	secret   []byte
+	users    atomic.Pointer[map[string]*user]
+	source   atomic.Pointer[UserSource]
+	sha256   *scram.Server
+	sha1     *scram.Server
+	x509     []config.X509Rule
+	oidc     *oidcVerifier
 }
+
+// UserSource supplies users that are not in the config file (the tenant
+// registry). It is consulted after the config users.
+type UserSource interface {
+	LookupUser(name string) (config.User, bool)
+}
+
+// SetSource installs the dynamic user source.
+func (a *Authenticator) SetSource(s UserSource) { a.source.Store(&s) }
 
 type user struct {
 	tenant string
-	cred   scram.StoredCredentials
+	sha256 *scram.StoredCredentials
+	sha1   *scram.StoredCredentials
+}
+
+func storedCredentials(name, what, salt string, iters int, storedKey, serverKey string) (*scram.StoredCredentials, error) {
+	s, err := base64.StdEncoding.DecodeString(salt)
+	if err != nil {
+		return nil, fmt.Errorf("user %q: %s salt: %w", name, what, err)
+	}
+	sk, err := base64.StdEncoding.DecodeString(storedKey)
+	if err != nil {
+		return nil, fmt.Errorf("user %q: %s storedKey: %w", name, what, err)
+	}
+	srvk, err := base64.StdEncoding.DecodeString(serverKey)
+	if err != nil {
+		return nil, fmt.Errorf("user %q: %s serverKey: %w", name, what, err)
+	}
+	if iters <= 0 || len(sk) == 0 || len(srvk) == 0 {
+		return nil, fmt.Errorf("user %q: %s credential needs salt, iterations, storedKey and serverKey", name, what)
+	}
+	return &scram.StoredCredentials{
+		KeyFactors: scram.KeyFactors{Salt: string(s), Iters: iters},
+		StoredKey:  sk,
+		ServerKey:  srvk,
+	}, nil
 }
 
 // New builds an Authenticator from configuration.
 func New(cfg config.Auth) (*Authenticator, error) {
-	a := &Authenticator{mode: cfg.Mode, static: cfg.StaticTenant, users: map[string]*user{}}
+	a := &Authenticator{mode: string(cfg.Mode), modes: cfg.Mode, static: cfg.StaticTenant, x509: cfg.X509}
 	if cfg.AppNameSecret != "" {
 		a.secret = []byte(cfg.AppNameSecret)
 	}
-	for _, u := range cfg.Users {
-		salt, err := base64.StdEncoding.DecodeString(u.Salt)
-		if err != nil {
-			return nil, fmt.Errorf("user %q: salt: %w", u.Username, err)
-		}
-		sk, err := base64.StdEncoding.DecodeString(u.StoredKey)
-		if err != nil {
-			return nil, fmt.Errorf("user %q: storedKey: %w", u.Username, err)
-		}
-		srvk, err := base64.StdEncoding.DecodeString(u.ServerKey)
-		if err != nil {
-			return nil, fmt.Errorf("user %q: serverKey: %w", u.Username, err)
-		}
-		if u.TenantID == "" || u.Iterations <= 0 {
-			return nil, fmt.Errorf("user %q: tenantId and iterations are required", u.Username)
-		}
-		a.users[u.Username] = &user{tenant: u.TenantID, cred: scram.StoredCredentials{
-			KeyFactors: scram.KeyFactors{Salt: string(salt), Iters: u.Iterations},
-			StoredKey:  sk,
-			ServerKey:  srvk,
-		}}
+	if err := a.SetUsers(cfg.Users); err != nil {
+		return nil, err
 	}
-	if cfg.Mode == "scram" {
-		s, err := scram.SHA256.NewServer(a.lookup)
-		if err != nil {
+	var err error
+	if cfg.Mode.Has("scram") {
+		if a.sha256, err = scram.SHA256.NewServer(a.lookup(false)); err != nil {
 			return nil, err
 		}
-		a.server = s
+	}
+	if cfg.Mode.Has("scram-sha-1") {
+		if a.sha1, err = scram.SHA1.NewServer(a.lookup(true)); err != nil {
+			return nil, err
+		}
+	}
+	if cfg.Mode.Has("oidc") {
+		if a.oidc, err = newOIDCVerifier(cfg.OIDC); err != nil {
+			return nil, err
+		}
 	}
 	return a, nil
 }
 
-// Mode reports the configured mode.
+// SetUsers atomically replaces the config-file users (used by hot reload). On
+// error the previous users stay in effect.
+func (a *Authenticator) SetUsers(us []config.User) error {
+	m := make(map[string]*user, len(us))
+	for _, u := range us {
+		pu, err := parseUser(u)
+		if err != nil {
+			return err
+		}
+		m[u.Username] = pu
+	}
+	a.users.Store(&m)
+	return nil
+}
+
+// SetAppNameSecret replaces the appName HMAC secret (hot reload).
+func (a *Authenticator) SetAppNameSecret(secret string) {
+	a.secretMu.Lock()
+	a.secret = []byte(secret)
+	if secret == "" {
+		a.secret = nil
+	}
+	a.secretMu.Unlock()
+}
+
+func parseUser(u config.User) (*user, error) {
+	if u.TenantID == "" {
+		return nil, fmt.Errorf("user %q: tenantId is required", u.Username)
+	}
+	nu := &user{tenant: u.TenantID}
+	if u.StoredKey != "" || u.Salt != "" || u.ServerKey != "" || u.Iterations != 0 {
+		c, err := storedCredentials(u.Username, "SCRAM-SHA-256", u.Salt, u.Iterations, u.StoredKey, u.ServerKey)
+		if err != nil {
+			return nil, err
+		}
+		nu.sha256 = c
+	}
+	if u.SHA1 != nil {
+		c, err := storedCredentials(u.Username, "SCRAM-SHA-1", u.SHA1.Salt, u.SHA1.Iterations, u.SHA1.StoredKey, u.SHA1.ServerKey)
+		if err != nil {
+			return nil, err
+		}
+		nu.sha1 = c
+	}
+	if nu.sha256 == nil && nu.sha1 == nil {
+		return nil, fmt.Errorf("user %q: no credential", u.Username)
+	}
+	return nu, nil
+}
+
+// find resolves a user from the config users, then the dynamic source.
+func (a *Authenticator) find(name string) (*user, bool) {
+	if m := a.users.Load(); m != nil {
+		if u, ok := (*m)[name]; ok {
+			return u, true
+		}
+	}
+	if src := a.source.Load(); src != nil {
+		if cu, ok := (*src).LookupUser(name); ok {
+			if u, err := parseUser(cu); err == nil {
+				return u, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// UserTenant reports the tenant a user is bound to ("" if the user no longer exists).
+func (a *Authenticator) UserTenant(name string) string {
+	if u, ok := a.find(name); ok {
+		return u.tenant
+	}
+	return ""
+}
+
+// UserBound reports whether the named user still exists and is bound to tenant.
+func (a *Authenticator) UserBound(name, tenant string) bool {
+	if m := a.users.Load(); m != nil {
+		if u, ok := (*m)[name]; ok {
+			return u.tenant == tenant
+		}
+	}
+	if src := a.source.Load(); src != nil {
+		if cu, ok := (*src).LookupUser(name); ok {
+			return cu.TenantID == tenant
+		}
+	}
+	return false
+}
+
+// Mode reports the configured mode string (comma separated when several).
 func (a *Authenticator) Mode() string { return a.mode }
+
+// Has reports whether an auth mode ("scram", "x509", ...) is enabled.
+func (a *Authenticator) Has(mode string) bool { return a.modes.Has(mode) }
+
+// Mechanisms lists the SASL mechanisms the proxy accepts, strongest first.
+func (a *Authenticator) Mechanisms() []string {
+	var out []string
+	if a.sha256 != nil {
+		out = append(out, MechSCRAM256)
+	}
+	if a.sha1 != nil {
+		out = append(out, MechSCRAM1)
+	}
+	if len(a.x509) > 0 && a.Has("x509") {
+		out = append(out, MechX509)
+	}
+	if a.oidc != nil {
+		out = append(out, MechOIDC)
+	}
+	return out
+}
+
+// SupportedMechs answers hello's saslSupportedMechs ("<db>.<user>"): the
+// SCRAM mechanisms the user has credentials for (all enabled ones when the
+// user is unknown, so existence is not revealed), plus the certificate and
+// token mechanisms.
+func (a *Authenticator) SupportedMechs(dbUser string) []string {
+	name := dbUser
+	if i := strings.IndexByte(dbUser, '.'); i >= 0 {
+		name = dbUser[i+1:]
+	}
+	u, _ := a.find(name)
+	var out []string
+	for _, m := range a.Mechanisms() {
+		switch {
+		case m == MechSCRAM256 && u != nil && u.sha256 == nil,
+			m == MechSCRAM1 && u != nil && u.sha1 == nil:
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
 
 // StaticTenant returns the tenant for static mode.
 func (a *Authenticator) StaticTenant() string { return a.static }
 
-func (a *Authenticator) lookup(name string) (scram.StoredCredentials, error) {
-	u, ok := a.users[name]
-	if !ok {
-		return scram.StoredCredentials{}, ErrAuthFailed
+func (a *Authenticator) lookup(sha1 bool) scram.CredentialLookup {
+	return func(name string) (scram.StoredCredentials, error) {
+		u, ok := a.find(name)
+		if !ok {
+			return scram.StoredCredentials{}, ErrAuthFailed
+		}
+		c := u.sha256
+		if sha1 {
+			c = u.sha1
+		}
+		if c == nil {
+			return scram.StoredCredentials{}, ErrAuthFailed
+		}
+		return *c, nil
 	}
-	return u.cred, nil
 }
 
 // SignTenant produces the appName for a tenant when a secret is configured.
@@ -94,7 +276,10 @@ func SignTenant(secret, tenant string) string {
 
 // ResolveAppName extracts the tenant from the driver's appName.
 func (a *Authenticator) ResolveAppName(appName string) (string, error) {
-	if a.secret == nil {
+	a.secretMu.RLock()
+	secret := a.secret
+	a.secretMu.RUnlock()
+	if secret == nil {
 		if appName == "" {
 			return "", ErrAuthFailed
 		}
@@ -105,28 +290,41 @@ func (a *Authenticator) ResolveAppName(appName string) (string, error) {
 		return "", ErrAuthFailed
 	}
 	tenant := appName[:i]
-	want := SignTenant(string(a.secret), tenant)
+	want := SignTenant(string(secret), tenant)
 	if !hmac.Equal([]byte(want), []byte(appName)) {
 		return "", ErrAuthFailed
 	}
 	return tenant, nil
 }
 
-// SASL is an in-progress SCRAM-SHA-256 conversation with a client.
+// ErrMechanismUnavailable is returned for a mechanism that is not enabled.
+var ErrMechanismUnavailable = errors.New("authentication mechanism is not enabled")
+
+// SASL is an in-progress SCRAM conversation with a client.
 type SASL struct {
 	a         *Authenticator
 	conv      *scram.ServerConversation
 	skipEmpty bool
 	finalSent bool
 	tenant    string
+	username  string
 }
 
+// Username returns the authenticated user name ("" until authentication completes).
+func (s *SASL) Username() string { return s.username }
+
 // StartSASL begins a conversation from the client-first message.
-func (a *Authenticator) StartSASL(clientFirst []byte, skipEmpty bool) (*SASL, []byte, error) {
-	if a.server == nil {
-		return nil, nil, errors.New("SCRAM authentication is not enabled")
+func (a *Authenticator) StartSASL(mech string, clientFirst []byte, skipEmpty bool) (*SASL, []byte, error) {
+	srv := a.sha256
+	if mech == MechSCRAM1 {
+		srv = a.sha1
+	} else if mech != MechSCRAM256 {
+		srv = nil
 	}
-	s := &SASL{a: a, conv: a.server.NewConversation(), skipEmpty: skipEmpty}
+	if srv == nil {
+		return nil, nil, ErrMechanismUnavailable
+	}
+	s := &SASL{a: a, conv: srv.NewConversation(), skipEmpty: skipEmpty}
 	out, err := s.conv.Step(string(clientFirst))
 	if err != nil {
 		return nil, nil, ErrAuthFailed
@@ -148,7 +346,11 @@ func (s *SASL) Continue(payload []byte) (out []byte, done bool, err error) {
 	if !s.conv.Done() {
 		return []byte(resp), false, nil
 	}
-	s.tenant = s.a.users[s.conv.Username()].tenant
+	s.username = s.conv.Username()
+	s.tenant = s.a.UserTenant(s.username)
+	if s.tenant == "" {
+		return nil, false, ErrAuthFailed
+	}
 	s.finalSent = true
 	return []byte(resp), s.skipEmpty, nil
 }
@@ -178,6 +380,36 @@ func NewUser(username, tenant, password string) (config.User, error) {
 	return config.User{
 		Username:   username,
 		TenantID:   tenant,
+		Salt:       base64.StdEncoding.EncodeToString(salt),
+		Iterations: iters,
+		StoredKey:  base64.StdEncoding.EncodeToString(cred.StoredKey),
+		ServerKey:  base64.StdEncoding.EncodeToString(cred.ServerKey),
+	}, nil
+}
+
+// SHA1Password is the legacy MONGODB-CR style digest SCRAM-SHA-1 is computed
+// from: hex(md5("<user>:mongo:<password>")).
+func SHA1Password(username, password string) string {
+	h := md5.Sum([]byte(username + ":mongo:" + password))
+	return hex.EncodeToString(h[:])
+}
+
+// NewSHA1Credential derives a SCRAM-SHA-1 credential for a password.
+func NewSHA1Credential(username, password string) (*config.SCRAMCredential, error) {
+	client, err := scram.SHA1.NewClient(username, SHA1Password(username, password), "")
+	if err != nil {
+		return nil, err
+	}
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, err
+	}
+	const iters = 10000
+	cred, err := client.GetStoredCredentialsWithError(scram.KeyFactors{Salt: string(salt), Iters: iters})
+	if err != nil {
+		return nil, err
+	}
+	return &config.SCRAMCredential{
 		Salt:       base64.StdEncoding.EncodeToString(salt),
 		Iterations: iters,
 		StoredKey:  base64.StdEncoding.EncodeToString(cred.StoredKey),

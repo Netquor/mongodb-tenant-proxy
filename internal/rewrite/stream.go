@@ -25,7 +25,11 @@ func streamSpec(q *request) *StreamSpec {
 			return nil
 		}
 	}
-	stages, err := q.body.Lookup("pipeline").Array().Values()
+	pa, ok := q.body.Lookup("pipeline").ArrayOK()
+	if !ok {
+		return nil
+	}
+	stages, err := pa.Values()
 	if err != nil || len(stages) == 0 || len(stages) > 2 {
 		return nil
 	}

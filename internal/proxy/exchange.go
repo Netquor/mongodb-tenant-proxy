@@ -48,17 +48,17 @@ func (c *conn) exchange(h wire.Header, flags uint32, res *rewrite.Result, getMor
 	rt := c.rt
 	for attempt := 0; ; attempt++ {
 		retry := attempt == 0 && !rt.inTxn && rt.pinned == nil
-		if err := wire.WriteFrame(c.up, h.RequestID, 0, wire.OpMsg, frame); err != nil {
+		if err := c.writeUp(h.RequestID, res.Command, frame); err != nil {
 			c.upFailed(err)
 			if retry && c.useUp(rt) == nil {
 				c.s.M.UpstreamRetries.Add(1)
 				continue
 			}
-			c.s.M.Command(res.Command, "error")
+			c.cmdDone(res.Command, "error")
 			return c.reply(h, c.upstreamError(rt, err))
 		}
 		if flags&wire.FlagMoreToCome != 0 {
-			c.s.M.Command(res.Command, "ok")
+			c.cmdDone(res.Command, "ok")
 			return nil // unacknowledged write: no reply
 		}
 		again, err := c.relayReply(h, flags, res, getMoreID, rt, retry)
@@ -68,7 +68,7 @@ func (c *conn) exchange(h wire.Header, flags uint32, res *rewrite.Result, getMor
 				continue
 			}
 			err = errors.New("no primary available")
-			c.s.M.Command(res.Command, "error")
+			c.cmdDone(res.Command, "error")
 			return c.reply(h, c.upstreamError(rt, err))
 		}
 		return err
@@ -83,21 +83,25 @@ func (c *conn) relayReply(h wire.Header, flags uint32, res *rewrite.Result, getM
 	if err != nil {
 		return c.replyFailed(h, res, rt, canRetry && rt.read, err, false)
 	}
-	if rh.OpCode != wire.OpMsg {
+	if rh.OpCode != wire.OpMsg && rh.OpCode != wire.OpCompressed {
 		u.MarkBroken()
 		return false, errors.New("unexpected upstream opcode")
 	}
-	patch := res.Post != nil || res.Alias != "" || len(res.After) > 0
-	limit := c.s.cfg.MaxMessageBytes
+	maxMsg := c.s.cfg.MaxMessageBytes
+	patch := res.Post != nil || res.Alias != "" || len(res.After) > 0 || res.IDCursor
+	needParse := patch || tracksCursor(res.Command)
+	limit := maxMsg
 	if patch {
 		limit = min(limit, c.maxPatchBytes())
 	}
-	stream := !patch && c.streamThreshold() > 0 && int(rh.Length) > c.streamThreshold()
+	overQuota := c.lim != nil && c.lim.L.MaxResultBytes > 0 && int(rh.Length) > c.lim.L.MaxResultBytes
+	stream := rh.OpCode == wire.OpMsg && c.reqComp == wire.CompNone && !patch && !overQuota &&
+		c.streamThreshold() > 0 && int(rh.Length) > c.streamThreshold()
 	if !stream && int(rh.Length) > limit {
 		// Too big to hold in memory for rewriting: refuse, and drop the
 		// connection since the unread reply is still on it.
 		c.upFailed(wire.ErrTooLarge)
-		c.s.M.Command(res.Command, "error")
+		c.cmdDone(res.Command, "error")
 		return false, c.reply(h, errorDoc(10334, "BSONObjectTooLarge",
 			fmt.Sprintf("tenant proxy: reply of %d bytes exceeds the %d byte limit for rewritten replies", rh.Length, limit)))
 	}
@@ -107,6 +111,34 @@ func (c *conn) relayReply(h wire.Header, flags uint32, res *rewrite.Result, getM
 	rb := make([]byte, int(rh.Length)-16)
 	if _, err := io.ReadFull(u.R, rb); err != nil {
 		return c.replyFailed(h, res, rt, canRetry && rt.read, err, false)
+	}
+	raw := false
+	if rh.OpCode == wire.OpCompressed {
+		// Relay a compressed reply untouched when the client expects the same
+		// compressor and nothing needs to look inside; small ones are opened
+		// so failover errors are noticed.
+		if id, ok := wire.CompressorID(rb); ok && !needParse && id == c.reqComp && id != wire.CompNone && len(rb) > statusScanLimit {
+			raw = true
+		} else {
+			op, _, data, err := wire.Decompress(rb, maxMsg)
+			if err != nil || op != wire.OpMsg {
+				u.MarkBroken()
+				return false, fmt.Errorf("upstream read: bad compressed reply: %v", err)
+			}
+			rb = data
+		}
+	}
+	if raw {
+		c.afterReply(res.Command, rt)
+		c.cmdDone(res.Command, "ok")
+		c.countOut(int64(len(rb) + 16))
+		if c.lim != nil {
+			c.lim.CountReply(len(rb) + 16)
+		}
+		return false, wire.WriteFrame(c.nc, rh.RequestID, h.RequestID, wire.OpCompressed, rb)
+	}
+	if c.lim != nil && c.lim.L.MaxResultBytes > 0 && len(rb) > c.lim.L.MaxResultBytes {
+		return false, c.oversize(h, rb, res, getMoreID)
 	}
 
 	var rm *wire.Msg
@@ -132,14 +164,14 @@ func (c *conn) relayReply(h wire.Header, flags uint32, res *rewrite.Result, getM
 			}
 		}
 	}
-	if patch || tracksCursor(res.Command) {
+	if needParse {
 		if err := parse(); err != nil {
 			return false, err
 		}
 		if len(res.After) > 0 {
 			if ok, _ := rm.Body.Lookup("ok").AsInt64OK(); ok == 1 {
 				if bad := c.runSteps(res.After); bad != nil {
-					c.s.M.Command(res.Command, "error")
+					c.cmdDone(res.Command, "error")
 					return false, c.reply(h, bad)
 				}
 			}
@@ -154,11 +186,30 @@ func (c *conn) relayReply(h wire.Header, flags uint32, res *rewrite.Result, getM
 			c.noteViewCursor(rm.Body, res.Phys, getMoreID)
 		}
 		c.trackCursor(res.Command, getMoreID, rm.Body)
+		if res.IDCursor {
+			c.noteIDCursor(res.Command, getMoreID, rm.Body)
+		}
 	}
 	c.afterReply(res.Command, rt)
-	c.s.M.Command(res.Command, "ok")
-	c.s.M.BytesOut.Add(int64(len(rb) + 16))
-	return false, wire.WriteFrame(c.nc, rh.RequestID, h.RequestID, wire.OpMsg, rb)
+	c.cmdDone(res.Command, "ok")
+	c.countOut(int64(len(rb) + 16))
+	if c.lim != nil {
+		c.lim.CountReply(len(rb) + 16)
+	}
+	return false, c.send(rh.RequestID, h.RequestID, wire.OpMsg, rb)
+}
+
+// writeUp sends a request upstream, compressing it when the upstream
+// connection negotiated compression and the command may be compressed.
+func (c *conn) writeUp(requestID int32, cmd string, body []byte) error {
+	if c.up.Comp != wire.CompNone && wire.Compressible(cmd) {
+		cb, err := wire.Compress(c.up.Comp, wire.OpMsg, body)
+		if err != nil {
+			return err
+		}
+		return wire.WriteFrame(c.up, requestID, 0, wire.OpCompressed, cb)
+	}
+	return wire.WriteFrame(c.up, requestID, 0, wire.OpMsg, body)
 }
 
 // labelFailover adds the error labels drivers need to retry a command that hit
@@ -197,6 +248,7 @@ func (c *conn) afterReply(cmd string, rt route) {
 // connection is healthy) - used before repeating a command on the new primary.
 func (c *conn) dropUp() {
 	u := c.up
+	c.detach()
 	c.up = nil
 	if u == nil {
 		return
@@ -213,7 +265,7 @@ func (c *conn) replyFailed(h wire.Header, res *rewrite.Result, rt route, retry b
 	if retry {
 		return true, nil
 	}
-	c.s.M.Command(res.Command, "error")
+	c.cmdDone(res.Command, "error")
 	return false, c.reply(h, c.upstreamError(rt, err))
 }
 
@@ -251,8 +303,11 @@ func (c *conn) streamReply(h wire.Header, res *rewrite.Result, getMoreID int64, 
 	}
 	c.afterReply(res.Command, c.rt)
 	c.s.M.StreamedReplies.Add(1)
-	c.s.M.Command(res.Command, "ok")
-	c.s.M.BytesOut.Add(int64(rh.Length))
+	c.cmdDone(res.Command, "ok")
+	c.countOut(int64(rh.Length))
+	if c.lim != nil {
+		c.lim.CountReply(int(rh.Length))
+	}
 	return nil
 }
 

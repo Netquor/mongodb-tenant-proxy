@@ -17,6 +17,9 @@ type Command struct {
 	CacheKey string
 	// IgnoreCodes are server error codes that count as success.
 	IgnoreCodes []int32
+	// Func, when set, is run instead of Body (After steps that need several
+	// commands, such as the transactional $out swap).
+	Func func(Upstream) error
 }
 
 type extras struct {
@@ -34,6 +37,16 @@ const outMarker = "__mtp_out"
 // means a tenant can never overwrite another tenant's document. Documents are
 // stamped with the tenant immediately before the write.
 func (r *Rewriter) rewriteWrite(t *Tenant, stage string, spec value, ex *extras) ([]value, error) {
+	w, err := r.rewriteWriteStages(t, stage, spec, ex)
+	if err == nil && r.genOn() {
+		// Documents produced by a pipeline have computed _ids; make sure they
+		// are ObjectIds before they reach the shared collection.
+		w = append([]value{idCheckStage()}, w...)
+	}
+	return w, err
+}
+
+func (r *Rewriter) rewriteWriteStages(t *Tenant, stage string, spec value, ex *extras) ([]value, error) {
 	stamp := docValue(buildDoc(bsoncore.AppendDocumentElement(nil, "$set", r.tenantDoc(t))))
 	if stage == "$out" {
 		return r.rewriteOut(t, spec, ex, stamp)
@@ -108,6 +121,17 @@ func (r *Rewriter) rewriteWrite(t *Tenant, stage string, spec value, ex *extras)
 		}
 		on = append(on, f)
 	}
+	// `on: []` or `on: "tenantId"` would otherwise ask for a unique index on the
+	// tenant field alone, capping every tenant at one document in a collection
+	// they all share.
+	if len(on) < 2 {
+		return nil, badValue("$merge on must name at least one field other than %q", r.field)
+	}
+	for _, f := range on {
+		if f == "" || strings.HasPrefix(f, "$") || strings.Contains(f, "\x00") {
+			return nil, badValue("invalid $merge on field %q", f)
+		}
+	}
 	ex.before = append(ex.before, r.uniqueIndex(db, coll, on))
 
 	out := make([]byte, 4, 128)
@@ -169,6 +193,9 @@ func (r *Rewriter) rewriteOut(t *Tenant, spec value, ex *extras, stamp value) ([
 		return nil, err
 	}
 	ex.before = append(ex.before, r.uniqueIndex(db, coll, []string{r.field, "_id"}))
+	if r.atomicOut != nil && r.atomicOut() {
+		return r.rewriteAtomicOut(t, db, coll, ex, stamp), nil
+	}
 
 	// $out replaces the whole collection; on a shared collection that means
 	// "replace this tenant's documents". Stamp a run marker, merge, then
@@ -257,8 +284,12 @@ func (r *Rewriter) uniqueIndex(db, coll string, keys []string) Command {
 
 // ---- mapReduce -------------------------------------------------------------
 
-// cmdMapReduce supports inline mapReduce over the tenant's documents. The
-// functions run inside mongod without access to other collections.
+// cmdMapReduce supports mapReduce with inline output or output to a
+// collection (replace, merge or reduce). The functions run inside mongod over
+// the tenant's documents only. Collection output is staged in a private
+// collection and then installed into the shared target for the tenant, so
+// "replace" only replaces the tenant's results and every result document
+// carries the tenant field.
 func (r *Rewriter) cmdMapReduce(q *request) (*Result, error) {
 	if err := noSeqs(q); err != nil {
 		return nil, err
@@ -269,12 +300,129 @@ func (r *Rewriter) cmdMapReduce(q *request) (*Result, error) {
 	if !r.js {
 		return nil, deny("mapReduce runs server-side JavaScript, which is disabled")
 	}
-	if out, ok := q.body.Lookup("out").DocumentOK(); !ok || out.Lookup("inline").Type == 0 {
-		return nil, deny("mapReduce output to a collection is not supported; use inline output or $merge")
+	if r.nsOn() {
+		return nil, nsUnsupported("mapReduce")
 	}
 	b, err := r.scopeField(q, q.body, "query")
 	if err != nil {
 		return nil, err
 	}
-	return &Result{Body: b}, nil
+	outV := q.body.Lookup("out")
+	if od, ok := outV.DocumentOK(); ok && od.Lookup("inline").Type != 0 {
+		return &Result{Body: b}, nil
+	}
+
+	mode, target := modeReplace, value{}
+	switch outV.Type {
+	case bsoncore.TypeString:
+		target = docValue(buildDoc(bsoncore.AppendStringElement(nil, "coll", outV.StringValue())))
+	case bsoncore.TypeEmbeddedDocument:
+		od := outV.Document()
+		els, err := od.Elements()
+		if err != nil || len(els) == 0 {
+			return nil, badValue("malformed mapReduce out")
+		}
+		coll, dbName := "", ""
+		picked := 0
+		for _, e := range els {
+			switch e.Key() {
+			case "replace", "merge", "reduce":
+				picked++
+				mode = map[string]installMode{"replace": modeReplace, "merge": modeMerge, "reduce": modeReduce}[e.Key()]
+				coll, _ = e.Value().StringValueOK()
+			case "db":
+				dbName, _ = e.Value().StringValueOK()
+			case "sharded", "nonAtomic":
+			default:
+				return nil, badValue("unknown mapReduce out option %q", e.Key())
+			}
+		}
+		if picked != 1 || coll == "" {
+			return nil, badValue("mapReduce out requires exactly one of replace, merge, reduce, inline")
+		}
+		t := buildDoc(bsoncore.AppendStringElement(nil, "coll", coll))
+		if dbName != "" {
+			t = buildDoc(bsoncore.AppendStringElement(nil, "coll", coll), bsoncore.AppendStringElement(nil, "db", dbName))
+		}
+		target = docValue(t)
+	default:
+		return nil, badValue("mapReduce requires out")
+	}
+	dstDB, dst, err := r.target(q.db, target)
+	if err != nil {
+		return nil, err
+	}
+	reduceFn := ""
+	if mode == modeReduce {
+		rv := q.body.Lookup("reduce")
+		if s, ok := rv.StringValueOK(); ok {
+			reduceFn = s
+		} else if c, ok := rv.JavaScriptOK(); ok {
+			reduceFn = c
+		} else {
+			return nil, badValue("mapReduce reduce must be a function")
+		}
+	}
+	if err := noTxn(q); err != nil {
+		return nil, err
+	}
+
+	var rb [8]byte
+	rand.Read(rb[:])
+	tmp := "__mtp_mr_" + hex.EncodeToString(rb[:])
+	srcDB := q.db
+	// Stage in a private collection; drop the client's out/db/$db options.
+	staged := make([]byte, 4, len(b)+64)
+	els, _ := b.Elements()
+	for _, e := range els {
+		switch e.Key() {
+		case "out", "$db":
+		default:
+			staged = append(staged, e...)
+		}
+	}
+	staged = bsoncore.AppendDocumentElement(staged, "out", buildDoc(bsoncore.AppendStringElement(nil, "replace", tmp)))
+	stagedCmd := finishDoc(staged)
+	t := q.t
+	res := &Result{}
+	res.Run = func(u Upstream) (bsoncore.Document, error) {
+		bu := bound{u, t}
+		resp, err := run(bu, srcDB, stagedCmd)
+		if err != nil {
+			return nil, err
+		}
+		defer u.Run(srcDB, buildDoc(bStr("drop", tmp)))
+		if err := r.install(bu, srcDB, tmp, dstDB, dst, mode, reduceFn); err != nil {
+			return nil, err
+		}
+		result := strVal(dst)
+		if dstDB != srcDB {
+			result = docValue(buildDoc(bStr("db", dstDB), bStr("collection", dst)))
+		}
+		out := buildDoc(valElem("result", result))
+		if c := resp.Lookup("counts"); c.Type != 0 {
+			out = appendRaw(out, valElem("counts", c))
+		}
+		if tm := resp.Lookup("timeMillis"); tm.Type != 0 {
+			out = appendRaw(out, valElem("timeMillis", tm))
+		}
+		return appendRaw(out, bI32("ok", 1)), nil
+	}
+	return res, nil
+}
+
+// rewriteAtomicOut makes $out write to a private staging collection and then
+// swap the tenant's documents in the target in one transaction (see install).
+func (r *Rewriter) rewriteAtomicOut(t *Tenant, db, coll string, ex *extras, stamp value) []value {
+	var rb [8]byte
+	rand.Read(rb[:])
+	tmp := "__mtp_out_" + hex.EncodeToString(rb[:])
+	out := docValue(buildDoc(bsoncore.AppendDocumentElement(nil, "$out", buildDoc(
+		bsoncore.AppendStringElement(nil, "db", db), bsoncore.AppendStringElement(nil, "coll", tmp)))))
+	ex.after = append(ex.after, Command{DB: db, Func: func(u Upstream) error {
+		b := bound{u, t}
+		defer u.Run(db, buildDoc(bStr("drop", tmp)))
+		return r.install(b, db, tmp, db, coll, modeReplace, "")
+	}})
+	return []value{stamp, out}
 }

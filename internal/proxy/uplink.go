@@ -62,7 +62,7 @@ func (c *conn) planRoute(name string, body bsoncore.Document) (route, error) {
 	default:
 		rt.read = readCommands[name]
 	}
-	if rt.read && !rt.inTxn && !c.s.dial.Direct() {
+	if rt.read && !rt.inTxn && c.s.dial != nil && !c.s.dial.Direct() {
 		if rp, ok := body.Lookup("$readPreference").DocumentOK(); ok {
 			sel, err := upstream.ParseReadPref(rp)
 			if err != nil {
@@ -135,6 +135,7 @@ func (c *conn) useUp(rt route) error {
 			return err
 		}
 		c.up = u
+		c.attach()
 	}
 	if rt.startTxn && c.pooled() {
 		c.txnConn = c.up
@@ -146,7 +147,27 @@ func (c *conn) setUp(u *upstream.Conn) {
 	if c.up != u {
 		c.releaseUp()
 		c.up = u
+		c.attach()
 	}
+}
+
+// attach records the local address of c.up so $currentOp can attribute
+// operations to the tenant using it (pooled connections change hands, so the
+// registration lasts only while this client holds the connection).
+func (c *conn) attach() {
+	if c.up == nil || c.tenant == nil || c.s.dial == nil {
+		return
+	}
+	c.detach()
+	c.upAddr = c.up.LocalAddr().String()
+	c.s.registerUp(c.tenant.ID, c.upAddr)
+}
+
+func (c *conn) detach() {
+	if c.upAddr != "" && c.tenant != nil {
+		c.s.unregisterUp(c.tenant.ID, c.upAddr)
+	}
+	c.upAddr = ""
 }
 
 // acquire returns a connection to addr: the shared pool in pooled mode, this
@@ -181,6 +202,7 @@ func (c *conn) isPinned(u *upstream.Conn) bool {
 // releaseUp gives the current connection back unless something pins it.
 func (c *conn) releaseUp() {
 	u := c.up
+	c.detach()
 	c.up = nil
 	if u != nil && c.pooled() && !c.isPinned(u) {
 		c.s.dial.Release(u)
@@ -195,6 +217,7 @@ func (c *conn) endCommand() { c.releaseUp() }
 // the topology learns about it and any pins on it are void.
 func (c *conn) upFailed(err error) {
 	u := c.up
+	c.detach()
 	c.up = nil
 	c.failConn(u, err)
 }
@@ -205,6 +228,7 @@ func (c *conn) failConn(u *upstream.Conn, err error) {
 		return
 	}
 	if c.up == u {
+		c.detach()
 		c.up = nil
 	}
 	if u == c.txnConn {
@@ -263,7 +287,9 @@ func (c *conn) unpinTail(id int64) {
 // idempotent, so a transport failure is retried once on a fresh connection.
 func (c *conn) runUp(rt route, db string, cmd bsoncore.Document) (bsoncore.Document, error) {
 	resp, err := c.s.dial.RunCommand(c.up, db, cmd)
-	if err != nil && upstream.IsNetwork(err) && !rt.inTxn && rt.pinned == nil {
+	// Never repeat a command that belongs to a transaction (the proxy's own
+	// multi-step commands start one): the retry would land outside it.
+	if err != nil && upstream.IsNetwork(err) && !rt.inTxn && rt.pinned == nil && cmd.Lookup("autocommit").Type == 0 {
 		c.upFailed(err)
 		if c.useUp(rt) != nil {
 			return nil, err
@@ -318,7 +344,7 @@ func (c *conn) abortOpenTxn() {
 	if c.txnConn == nil || c.txnBody == nil {
 		return
 	}
-	c.up = c.txnConn
+	c.setUp(c.txnConn)
 	c.up.SetDeadline(time.Now().Add(2 * time.Second))
 	c.s.dial.RunCommand(c.up, "admin", c.txnBody)
 }

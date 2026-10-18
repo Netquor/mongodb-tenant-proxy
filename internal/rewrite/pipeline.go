@@ -23,6 +23,9 @@ func (r *Rewriter) scopePipeline(t *Tenant, p arr, inject bool, ex *extras) (arr
 	if err != nil {
 		return nil, badValue("malformed pipeline")
 	}
+	if len(stages) > maxPipelineStages {
+		return nil, badValue("pipeline exceeds %d stages", maxPipelineStages)
+	}
 	out := make([]value, 0, len(stages)+1)
 	scopedFirst := false
 	for i, s := range stages {
@@ -70,8 +73,8 @@ func (r *Rewriter) scopePipeline(t *Tenant, p arr, inject bool, ex *extras) (arr
 			if !r.cs {
 				return nil, deny("change streams are not enabled")
 			}
-			if !inject || i != 0 {
-				return nil, deny("$changeStream must be the first stage of a collection aggregate")
+			if !inject || i != 0 || ex == nil {
+				return nil, deny("$changeStream must be the first stage of a top-level aggregate")
 			}
 			cs, err := r.rewriteChangeStream(t, spec, ex != nil && ex.dbLevel)
 			if err != nil {
@@ -89,6 +92,21 @@ func (r *Rewriter) scopePipeline(t *Tenant, p arr, inject bool, ex *extras) (arr
 				return nil, err
 			}
 			out = append(out, w...)
+			continue
+		case "$search", "$searchMeta", "$vectorSearch":
+			if !inject || i != 0 {
+				return nil, deny("%s must be the first stage of a collection aggregate", name)
+			}
+			ns, err := r.rewriteSearch(t, name, spec)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, docValue(buildDoc(valElem(name, ns))))
+			if name != "$searchMeta" && !returnsStoredSource(spec) {
+				// Defence in depth: the search itself is already filtered.
+				out = append(out, docValue(buildDoc(bsoncore.AppendDocumentElement(nil, "$match", r.tenantDoc(t)))))
+			}
+			scopedFirst = true
 			continue
 		case "$lookup":
 			ns, err = r.rewriteLookup(t, spec)

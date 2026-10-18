@@ -38,6 +38,9 @@ type Conn struct {
 	lastUsed time.Time
 	broken   bool
 	once     sync.Once
+	// Comp is the wire compressor negotiated with the upstream
+	// (wire.CompNone when compression is off).
+	Comp wire.Compressor
 }
 
 // MarkBroken makes the pool discard the connection instead of reusing it
@@ -62,6 +65,7 @@ type Dialer struct {
 	dial   net.Dialer
 	tls    *tls.Config
 	max    int
+	comps  []wire.Compressor // upstream.compressors, in preference order
 	ids    atomic.Int32
 	images sync.Map // "db.coll" -> struct{}
 
@@ -106,6 +110,9 @@ func NewDialer(cfg *config.Config) (*Dialer, error) {
 	if d.cfg.AuthSource == "" {
 		d.cfg.AuthSource = "admin"
 	}
+	if err := d.init(); err != nil {
+		return nil, err
+	}
 	d.dial.Timeout = cfg.DialDuration()
 	d.dial.KeepAlive = 30e9
 	build := func(on bool, ca string, skip bool, name string) (*tls.Config, error) {
@@ -123,6 +130,13 @@ func NewDialer(cfg *config.Config) (*Dialer, error) {
 				return nil, errors.New("upstream.caFile contains no certificates")
 			}
 			tc.RootCAs = pool
+		}
+		if cfg.Upstream.CertFile != "" {
+			cert, err := tls.LoadX509KeyPair(cfg.Upstream.CertFile, cfg.Upstream.KeyFile)
+			if err != nil {
+				return nil, fmt.Errorf("upstream client certificate: %w", err)
+			}
+			tc.Certificates = []tls.Certificate{cert}
 		}
 		return tc, nil
 	}
@@ -218,7 +232,11 @@ func (d *Dialer) dialAddr(ctx context.Context, addr string, auth bool) (*Conn, e
 	now := time.Now()
 	c := &Conn{Conn: nc, R: bufio.NewReaderSize(nc, 64*1024), Addr: addr, d: d, born: now, lastUsed: now}
 	d.open.Add(1)
-	if auth && d.cfg.Username != "" {
+	if err := d.negotiateCompression(c); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("upstream compression: %w", err)
+	}
+	if auth && d.cfg.Mechanism() != "" {
 		if err := d.authenticate(c); err != nil {
 			c.Close()
 			return nil, fmt.Errorf("upstream authentication: %w", err)
@@ -393,13 +411,26 @@ func (d *Dialer) Hello(ctx context.Context) (bsoncore.Document, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Monitors do not authenticate; fail fast on bad upstream credentials, TLS
+	// or compression settings by opening one real connection.
+	c, err := d.dialAddr(ctx, m.addr, true)
+	if err != nil {
+		return nil, err
+	}
+	c.Close()
 	d.topo.mu.Lock()
 	defer d.topo.mu.Unlock()
 	return m.desc.Hello, nil
 }
 
-func (d *Dialer) authenticate(c *Conn) error {
-	client, err := scram.SHA256.NewClient(d.cfg.Username, d.cfg.Password, "")
+func (d *Dialer) authSCRAM(c *Conn, mech string) error {
+	var client *scram.Client
+	var err error
+	if mech == "SCRAM-SHA-1" {
+		client, err = scram.SHA1.NewClient(d.cfg.Username, sha1Password(d.cfg.Username, d.cfg.Password), "")
+	} else {
+		client, err = scram.SHA256.NewClient(d.cfg.Username, d.cfg.Password, "")
+	}
 	if err != nil {
 		return err
 	}
@@ -411,7 +442,7 @@ func (d *Dialer) authenticate(c *Conn) error {
 	opts := bsoncore.BuildDocument(nil, bsoncore.AppendBooleanElement(nil, "skipEmptyExchange", true))
 	cmd := bsoncore.BuildDocument(nil,
 		bsoncore.AppendInt32Element(nil, "saslStart", 1),
-		bsoncore.AppendStringElement(nil, "mechanism", "SCRAM-SHA-256"),
+		bsoncore.AppendStringElement(nil, "mechanism", mech),
 		bsoncore.AppendBinaryElement(nil, "payload", 0, []byte(payload)),
 		bsoncore.AppendDocumentElement(nil, "options", opts),
 	)
@@ -501,7 +532,7 @@ func (d *Dialer) EnsureImagesDB(c *Conn, db string) error {
 	if err != nil {
 		return err
 	}
-	batch, _ := resp.Lookup("cursor", "firstBatch").ArrayOK()
+	batch, _ := wire.LookupPath(resp, "cursor", "firstBatch").ArrayOK()
 	vals, _ := batch.Values()
 	for _, v := range vals {
 		doc, _ := v.DocumentOK()

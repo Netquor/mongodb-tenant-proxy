@@ -1,0 +1,40 @@
+# MongoDB replica set + tenant proxy.
+#   docker compose -f deploy/compose/docker-compose.yml up --build
+# Clients connect to localhost:27018; the admin API is on localhost:9103.
+services:
+  mongo:
+    image: mongo:7
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    volumes: [mongo-data:/data/db]
+    healthcheck:
+      # initiates the replica set on first start, then reports healthy once primary
+      test: >
+        mongosh --quiet --eval '
+          try { if (!rs.status().ok) throw 0 }
+          catch (e) { rs.initiate({_id:"rs0",members:[{_id:0,host:"mongo:27017"}]}) }
+          quit(db.hello().isWritablePrimary ? 0 : 1)'
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+
+  proxy:
+    build:
+      context: ../..
+      args: { VERSION: compose }
+    depends_on:
+      mongo: { condition: service_healthy }
+    ports:
+      - "27018:27018"   # MongoDB wire protocol (tenant-scoped)
+      - "9102:9102"     # /metrics, /healthz
+      - "127.0.0.1:9103:9103"   # admin API
+    environment:
+      MTP_ADMIN_TOKEN: ${MTP_ADMIN_TOKEN:-change-me-change-me-change-me}
+    volumes:
+      - ./proxy.json:/etc/mongodb-tenant-proxy/proxy.json:ro
+      - proxy-data:/var/lib/mongodb-tenant-proxy
+    restart: unless-stopped
+
+volumes:
+  mongo-data:
+  proxy-data:

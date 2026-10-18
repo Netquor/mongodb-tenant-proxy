@@ -131,7 +131,7 @@ func TestReplicaSet(t *testing.T) {
 		}
 
 		// A multi-batch cursor: every getMore must reach the member that opened it.
-		sec := e.tenantOpts(t, "sec", nil).Database("sec").Collection("c", options.Collection().SetReadPreference(readpref.Secondary()).SetReadConcern(readconcern.Majority()))
+		sec := e.tenantOpts(t, "sec", nil).Database("sec").Collection("c", options.Collection().SetReadPreference(tagB).SetReadConcern(readconcern.Majority()))
 		gm := reads("getmore")
 		cur, err := sec.Find(context.Background(), bson.M{}, options.Find().SetBatchSize(10))
 		if err != nil {
@@ -471,19 +471,31 @@ func TestDedicatedMode(t *testing.T) {
 	}
 	sec := c.Database("ded").Collection("c", options.Collection().SetReadPreference(readpref.Secondary()).SetReadConcern(readconcern.Majority()))
 	waitCount(t, sec, 50)
-	cur, err := sec.Find(context.Background(), bson.M{}, options.Find().SetBatchSize(7))
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Each secondary advances its majority snapshot on its own schedule, so
+	// retry until the one serving the cursor has caught up.
 	n := 0
-	for cur.Next(context.Background()) {
-		n++
-	}
-	if n != 50 || cur.Err() != nil {
-		t.Fatalf("read %d, err %v", n, cur.Err())
+	for deadline := time.Now().Add(20 * time.Second); ; {
+		cur, err := sec.Find(context.Background(), bson.M{}, options.Find().SetBatchSize(7))
+		if err != nil {
+			t.Fatal(err)
+		}
+		n = 0
+		for cur.Next(context.Background()) {
+			n++
+		}
+		if cur.Err() != nil {
+			t.Fatal(cur.Err())
+		}
+		if n == 50 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("read %d of 50 documents", n)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	sess, _ := c.StartSession()
-	_, err = sess.WithTransaction(context.Background(), func(ctx context.Context) (any, error) {
+	_, err := sess.WithTransaction(context.Background(), func(ctx context.Context) (any, error) {
 		return coll.InsertOne(ctx, bson.M{"_id": "tx"})
 	})
 	if err != nil {

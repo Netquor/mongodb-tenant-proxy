@@ -1,11 +1,14 @@
 package proxy
 
 import (
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 
+	"github.com/netquor/mongodb-tenant-proxy/internal/auth"
 	"github.com/netquor/mongodb-tenant-proxy/internal/rewrite"
 	"github.com/netquor/mongodb-tenant-proxy/internal/upstream"
 	"github.com/netquor/mongodb-tenant-proxy/internal/wire"
@@ -18,6 +21,7 @@ func (c *conn) handleMsg(h wire.Header, body []byte) error {
 	}
 	name := rewrite.CommandName(m.Body)
 	db, _ := m.Body.Lookup("$db").StringValueOK()
+	c.beginCmd(name, db)
 	if err := rewrite.ValidateBody(m.Body); err != nil {
 		return c.reply(h, toErrorDoc(err))
 	}
@@ -30,11 +34,23 @@ func (c *conn) handleMsg(h wire.Header, body []byte) error {
 		c.txnBody = txnAbortBody(m.Body)
 	}
 
+	if rel, bad := c.admit(name, m, len(body)); bad != nil {
+		if m.Flags&wire.FlagMoreToCome != 0 {
+			return nil
+		}
+		return c.reply(h, bad)
+	} else {
+		defer rel()
+	}
+	defer c.syncCursors()
+
 	switch name {
 	case "hello", "isMaster", "ismaster":
 		return c.reply(h, c.hello(m.Body))
 	case "saslStart", "saslContinue":
 		return c.reply(h, c.handleSASL(name, m.Body))
+	case "authenticate":
+		return c.reply(h, c.handleAuthenticate(m.Body))
 	case "getMore":
 		return c.handleGetMore(h, m, db)
 	case "killCursors":
@@ -42,7 +58,7 @@ func (c *conn) handleMsg(h wire.Header, body []byte) error {
 	}
 
 	if c.tenant == nil && name != "ping" {
-		c.s.M.Command(name, "denied")
+		c.cmdDeny(name, "authentication required")
 		return c.reply(h, errorDoc(13, "Unauthorized", "tenant proxy: authentication required"))
 	}
 
@@ -50,12 +66,12 @@ func (c *conn) handleMsg(h wire.Header, body []byte) error {
 		return err
 	}
 
-	res, err := c.s.rw.Rewrite(c.tenant, db, m.Body, m.Seqs)
+	res, err := c.s.rt().rw.Rewrite(c.tenant, db, m.Body, m.Seqs)
 	if err == nil && name == "listCollections" {
 		c.hookListCollections(res, m.Body, db)
 	}
 	if err != nil {
-		c.s.M.Command(name, "denied")
+		c.cmdDeny(name, err.Error())
 		c.log.Warn("command denied", "db", db, "command", name, "reason", err.Error())
 		if m.Flags&wire.FlagMoreToCome != 0 {
 			return nil
@@ -63,8 +79,21 @@ func (c *conn) handleMsg(h wire.Header, body []byte) error {
 		return c.reply(h, toErrorDoc(err))
 	}
 	if res.Reply != nil {
-		c.s.M.Command(name, "ok")
+		c.cmdDone(name, "ok")
 		return c.reply(h, res.Reply)
+	}
+	if bad := changeStreamUnsupported(res, c.s.limits.maxWire); bad != nil {
+		c.s.M.Command(name, "error")
+		return c.reply(h, bad)
+	}
+	if res.Run != nil {
+		return c.runResult(h, m, res)
+	}
+	if len(res.Namespaces) > 0 {
+		if err := c.checkBulkViews(res); err != nil {
+			c.s.M.Command(name, "denied")
+			return c.reply(h, c.runErrorDoc(err))
+		}
 	}
 	if res.Stream != nil && c.s.fan != nil {
 		if handled, err := c.openStream(h, m, res); handled || err != nil {
@@ -84,9 +113,12 @@ func (c *conn) ensureUp() error {
 
 // forward sends a rewritten command upstream and relays the reply.
 func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMoreID int64) error {
+	if err := c.applyMaxTime(res); err != nil {
+		return c.reply(h, toErrorDoc(err))
+	}
 	if err := c.useUp(c.rt); err != nil {
 		c.log.Error("upstream unavailable", "err", err)
-		c.s.M.Command(res.Command, "error")
+		c.cmdDone(res.Command, "error")
 		return c.reply(h, c.upstreamError(c.rt, err))
 	}
 	if !c.s.cfg.ChangeStreams.DisableAutoImages && c.s.dbWatched(res.DB) {
@@ -115,7 +147,7 @@ func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMore
 		}
 	}
 	if bad := c.runSteps(res.Before); bad != nil {
-		c.s.M.Command(res.Command, "error")
+		c.cmdDone(res.Command, "error")
 		return c.reply(h, bad)
 	}
 	out := wire.Msg{
@@ -128,7 +160,7 @@ func (c *conn) forward(h wire.Header, flags uint32, res *rewrite.Result, getMore
 
 func tracksCursor(cmd string) bool {
 	switch cmd {
-	case "find", "aggregate", "listIndexes", "listCollections", "getMore":
+	case "find", "aggregate", "listIndexes", "listCollections", "getMore", "bulkWrite":
 		return true
 	}
 	return false
@@ -177,6 +209,7 @@ func (c *conn) noteCursor(cmd string, getMoreID int64, ok bool, id int64, ns str
 
 func (c *conn) forgetCursor(id int64) {
 	delete(c.cursors, id)
+	delete(c.idCursors, id)
 	delete(c.viewPhys, id)
 	delete(c.cursorAt, id)
 	c.unpinTail(id)
@@ -190,7 +223,7 @@ func (c *conn) handleGetMore(h wire.Header, m *wire.Msg, db string) error {
 		return c.streamGetMore(h, m, id, sub, ns)
 	}
 	if c.tenant == nil || !ok || len(m.Seqs) > 0 || !owned || ns != db+"."+coll {
-		c.s.M.Command("getMore", "denied")
+		c.cmdDeny("getMore", "cursor not owned by connection")
 		return c.reply(h, errorDoc(43, "CursorNotFound", fmt.Sprintf("cursor id %d not found", id)))
 	}
 	res := &rewrite.Result{Command: "getMore", DB: db, Body: m.Body}
@@ -200,6 +233,9 @@ func (c *conn) handleGetMore(h wire.Header, m *wire.Msg, db string) error {
 	c.rt.sel = upstream.Selector{Addr: c.cursorAt[id]}
 	c.rt.pinned = c.tails[id]
 	c.rt.tail = c.tails[id] != nil
+	if c.idCursors[id] {
+		res.IDCursor, res.Post = true, c.s.rt().rw.IDPost(c.tenant)
+	}
 	if phys, isView := c.viewPhys[id]; isView {
 		res.Body, res.Alias, res.Phys = withString(m.Body, "collection", phys), coll, phys
 	}
@@ -311,26 +347,61 @@ func (c *conn) helloDoc(legacy bool) bsoncore.Document {
 }
 
 func (c *conn) hello(req bsoncore.Document) bsoncore.Document {
-	if c.s.auth.Mode() == "appname" && c.tenant == nil {
-		if name, ok := req.Lookup("client", "application", "name").StringValueOK(); ok {
+	if c.s.auth.Has("appname") && c.tenant == nil {
+		if name, ok := wire.LookupPath(req, "client", "application", "name").StringValueOK(); ok {
 			id, err := c.s.auth.ResolveAppName(name)
 			if err == nil {
 				err = c.bindTenant(id)
+				if err == nil {
+					c.authOK()
+				}
 			}
 			if err != nil {
+				c.authFail("", "appName authentication failed")
 				c.log.Warn("appName authentication failed", "err", err)
 				return errorDoc(18, "AuthenticationFailed", "Authentication failed.")
 			}
 		}
 	}
 	d := c.helloDoc(false)
-	if c.s.auth.Mode() == "scram" {
-		if _, ok := req.Lookup("saslSupportedMechs").StringValueOK(); ok {
-			mech := bsoncore.BuildArray(nil, bsoncore.Value{Type: bsoncore.TypeString, Data: bsoncore.AppendString(nil, "SCRAM-SHA-256")})
-			d = insertBeforeOK(d, bsoncore.AppendArrayElement(nil, "saslSupportedMechs", mech))
+	if names := c.negotiateCompression(req); len(names) > 0 {
+		vals := make([]bsoncore.Value, len(names))
+		for i, n := range names {
+			vals[i] = bsoncore.Value{Type: bsoncore.TypeString, Data: bsoncore.AppendString(nil, n)}
+		}
+		d = insertBeforeOK(d, bsoncore.AppendArrayElement(nil, "compression", bsoncore.BuildArray(nil, vals...)))
+	}
+	if user, ok := req.Lookup("saslSupportedMechs").StringValueOK(); ok {
+		if mechs := c.s.auth.SupportedMechs(user); len(mechs) > 0 {
+			vals := make([]bsoncore.Value, len(mechs))
+			for i, m := range mechs {
+				vals[i] = bsoncore.Value{Type: bsoncore.TypeString, Data: bsoncore.AppendString(nil, m)}
+			}
+			d = insertBeforeOK(d, bsoncore.AppendArrayElement(nil, "saslSupportedMechs", bsoncore.BuildArray(nil, vals...)))
 		}
 	}
 	return d
+}
+
+// negotiateCompression returns the client's requested compressors that the
+// proxy has enabled, in the client's order.
+func (c *conn) negotiateCompression(req bsoncore.Document) []string {
+	if len(c.s.clientComp) == 0 {
+		return nil
+	}
+	arr, ok := req.Lookup("compression").ArrayOK()
+	if !ok {
+		return nil
+	}
+	vals, _ := arr.Values()
+	var out []string
+	for _, v := range vals {
+		n, _ := v.StringValueOK()
+		if id, ok := wire.CompressorByName(n); ok && c.s.clientComp[id] {
+			out = append(out, id.String())
+		}
+	}
+	return out
 }
 
 // insertBeforeOK appends an element to a document built by helloDoc.
@@ -362,53 +433,133 @@ func (c *conn) handleLegacy(h wire.Header, body []byte) error {
 	return wire.WriteFrame(c.nc, c.nextRequestID(), h.RequestID, wire.OpReply, wire.EncodeReply(resp))
 }
 
-// ---- SCRAM ---------------------------------------------------------------
+// ---- client authentication ----------------------------------------------
+
+func saslReply(done bool, payload []byte) bsoncore.Document {
+	return bsoncore.BuildDocument(nil,
+		bsoncore.AppendInt32Element(nil, "conversationId", 1),
+		bsoncore.AppendBooleanElement(nil, "done", done),
+		bsoncore.AppendBinaryElement(nil, "payload", 0, payload),
+		bsoncore.AppendInt32Element(nil, "ok", 1),
+	)
+}
+
+func authFailed() bsoncore.Document {
+	return errorDoc(18, "AuthenticationFailed", "Authentication failed.")
+}
+
+// authenticated binds the connection to the tenant a mechanism resolved. A
+// connection that is already bound can only re-authenticate as the same tenant.
+func (c *conn) authenticated(tenant string) error {
+	if c.tenant != nil {
+		if c.tenant.ID == tenant {
+			return nil
+		}
+		return errors.New("connection is already authenticated as another tenant")
+	}
+	if err := c.bindTenant(tenant); err != nil {
+		return err
+	}
+	c.authOK()
+	return nil
+}
 
 func (c *conn) handleSASL(name string, cmd bsoncore.Document) bsoncore.Document {
 	fail := func() bsoncore.Document {
 		c.sasl = nil
-		return errorDoc(18, "AuthenticationFailed", "Authentication failed.")
+		c.authFail(c.saslUser, "invalid credentials or tenant unavailable")
+		return authFailed()
 	}
-	if c.s.auth.Mode() != "scram" {
+	if len(c.s.auth.Mechanisms()) == 0 {
 		return errorDoc(59, "CommandNotFound", "tenant proxy: authentication is not enabled; the tenant is determined by the proxy")
 	}
 	_, payload, _ := cmd.Lookup("payload").BinaryOK()
-	var (
-		out  []byte
-		done bool
-		err  error
-	)
 	if name == "saslStart" {
-		if mech, _ := cmd.Lookup("mechanism").StringValueOK(); mech != "SCRAM-SHA-256" {
-			return errorDoc(334, "MechanismUnavailable", "tenant proxy: only SCRAM-SHA-256 is supported")
-		}
-		skip, _ := cmd.Lookup("options", "skipEmptyExchange").BooleanOK()
-		c.sasl, out, err = c.s.auth.StartSASL(payload, skip)
-		if err != nil {
-			return fail()
-		}
-	} else {
-		if c.sasl == nil {
-			return fail()
-		}
-		out, done, err = c.sasl.Continue(payload)
-		if err != nil {
-			return fail()
-		}
-		if c.sasl.Authenticated() && c.tenant == nil {
-			if err := c.bindTenant(c.sasl.Tenant()); err != nil {
-				c.log.Warn("tenant bind failed", "err", err)
+		mech, _ := cmd.Lookup("mechanism").StringValueOK()
+		switch mech {
+		case auth.MechOIDC:
+			return c.handleOIDC(payload)
+		case auth.MechSCRAM256, auth.MechSCRAM1:
+			skip, _ := wire.LookupPath(cmd, "options", "skipEmptyExchange").BooleanOK()
+			c.saslUser = saslUser(payload)
+			var out []byte
+			var err error
+			c.sasl, out, err = c.s.auth.StartSASL(mech, payload, skip)
+			if errors.Is(err, auth.ErrMechanismUnavailable) {
+				return errorDoc(334, "MechanismUnavailable", "tenant proxy: "+mech+" is not enabled")
+			}
+			if err != nil {
 				return fail()
 			}
+			return saslReply(false, out)
 		}
-		if done {
-			c.sasl = nil
+		return errorDoc(334, "MechanismUnavailable", "tenant proxy: unsupported mechanism "+mech)
+	}
+	if c.sasl == nil {
+		return fail()
+	}
+	out, done, err := c.sasl.Continue(payload)
+	if err != nil {
+		return fail()
+	}
+	if c.sasl.Authenticated() {
+		c.setUser(c.sasl.Username())
+		if err := c.authenticated(c.sasl.Tenant()); err != nil {
+			c.log.Warn("tenant bind failed", "err", err)
+			return fail()
 		}
 	}
+	if done {
+		c.sasl = nil
+	}
+	return saslReply(done, out)
+}
+
+// handleOIDC completes MONGODB-OIDC's machine flow: the client sends
+// {jwt: "<token>"} in saslStart.
+func (c *conn) handleOIDC(payload []byte) bsoncore.Document {
+	tok, ok := bsoncore.Document(payload).Lookup("jwt").StringValueOK()
+	if !ok || tok == "" {
+		c.log.Warn("oidc authentication failed", "err", "no jwt in payload (only the machine flow is supported)")
+		return authFailed()
+	}
+	tenant, err := c.s.auth.OIDC(tok)
+	if err == nil {
+		err = c.authenticated(tenant)
+	}
+	if err != nil {
+		c.log.Warn("oidc authentication failed", "err", err)
+		return authFailed()
+	}
+	return saslReply(true, []byte{})
+}
+
+// handleAuthenticate serves the legacy "authenticate" command, which drivers
+// use for MONGODB-X509 (identity comes from the TLS client certificate).
+func (c *conn) handleAuthenticate(cmd bsoncore.Document) bsoncore.Document {
+	mech, _ := cmd.Lookup("mechanism").StringValueOK()
+	if mech != auth.MechX509 {
+		return errorDoc(334, "MechanismUnavailable", "tenant proxy: unsupported mechanism "+mech)
+	}
+	if !c.s.auth.Has("x509") {
+		return errorDoc(334, "MechanismUnavailable", "tenant proxy: MONGODB-X509 is not enabled")
+	}
+	tc, ok := c.nc.(*tls.Conn)
+	if !ok {
+		return authFailed()
+	}
+	state := tc.ConnectionState()
+	user, _ := cmd.Lookup("user").StringValueOK()
+	tenant, err := c.s.auth.X509(&state, user)
+	if err == nil {
+		err = c.authenticated(tenant)
+	}
+	if err != nil {
+		c.log.Warn("x509 authentication failed", "err", err)
+		return authFailed()
+	}
 	return bsoncore.BuildDocument(nil,
-		bsoncore.AppendInt32Element(nil, "conversationId", 1),
-		bsoncore.AppendBooleanElement(nil, "done", done),
-		bsoncore.AppendBinaryElement(nil, "payload", 0, out),
+		bsoncore.AppendStringElement(nil, "dbname", "$external"),
 		bsoncore.AppendInt32Element(nil, "ok", 1),
 	)
 }
@@ -422,6 +573,12 @@ steps:
 			if _, done := c.s.steps.Load(cmd.CacheKey); done {
 				continue
 			}
+		}
+		if cmd.Func != nil {
+			if err := cmd.Func(connUp{c}); err != nil {
+				return c.runErrorDoc(err)
+			}
+			continue
 		}
 		resp, err := c.runUp(c.rt, cmd.DB, cmd.Body)
 		if err != nil {
@@ -456,4 +613,22 @@ func writeTarget(res *rewrite.Result) string {
 		}
 	}
 	return ""
+}
+
+// noteIDCursor remembers cursors whose documents need their _id unwrapped.
+func (c *conn) noteIDCursor(cmd string, getMoreID int64, resp bsoncore.Document) {
+	cur, ok := resp.Lookup("cursor").DocumentOK()
+	if !ok {
+		return
+	}
+	id, _ := cur.Lookup("id").AsInt64OK()
+	switch {
+	case id == 0 && cmd == "getMore":
+		delete(c.idCursors, getMoreID)
+	case id != 0 && cmd != "getMore":
+		if c.idCursors == nil {
+			c.idCursors = map[int64]bool{}
+		}
+		c.idCursors[id] = true
+	}
 }

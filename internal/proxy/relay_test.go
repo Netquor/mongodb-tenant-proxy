@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
-	"runtime"
+	goruntime "runtime"
 	"testing"
 
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
@@ -147,9 +147,9 @@ func BenchmarkRelayLargeBatch(b *testing.B) {
 			b.Run(fmt.Sprintf("%dMiB/%s", mb, mode), func(b *testing.B) {
 				up := bufio.NewReaderSize(&cycle{b: frame}, 64*1024)
 				out := bufio.NewWriterSize(io.Discard, relayBufSize)
-				runtime.GC()
-				var base runtime.MemStats
-				runtime.ReadMemStats(&base)
+				goruntime.GC()
+				var base goruntime.MemStats
+				goruntime.ReadMemStats(&base)
 				var peak uint64
 				b.SetBytes(int64(len(frame)))
 				b.ReportAllocs()
@@ -168,8 +168,8 @@ func BenchmarkRelayLargeBatch(b *testing.B) {
 						b.Fatal(err)
 					}
 					if i%4 == 0 {
-						var ms runtime.MemStats
-						runtime.ReadMemStats(&ms)
+						var ms goruntime.MemStats
+						goruntime.ReadMemStats(&ms)
 						if ms.HeapAlloc > peak {
 							peak = ms.HeapAlloc
 						}

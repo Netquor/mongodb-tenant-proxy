@@ -1,0 +1,95 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/netquor/mongodb-tenant-proxy
+  tag: ""            # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+# The proxy config file (proxy.json). Secrets (upstream password, admin token,
+# appName secret) are NOT put here: use the Secret below, which is injected as
+# environment variables (MTP_UPSTREAM_PASSWORD, MTP_ADMIN_TOKEN, ...).
+config:
+  listen: ":27018"
+  upstream:
+    addr: mongo.internal:27017
+    username: proxy-user
+    authSource: admin
+    tls: false
+    # caFile: /etc/ssl/mongo/ca.pem   (mount it with extraVolumes)
+  tenant: { field: tenantId, idType: string }
+  databases: []
+  auth:
+    mode: scram
+    users: []        # {username, tenantId, salt, iterations, storedKey, serverKey}; or manage tenants via the admin API
+  maxConnsPerTenant: 200
+  idleTimeout: 10m
+  logLevel: info
+  metricsAddr: ":9102"
+  adminAddr: ""        # e.g. ":9103" (requires secrets.adminToken or existingSecret)
+  admin: {}
+  store:
+    type: mongo      # file | mongo (use mongo with more than one replica)
+    database: mtp_control
+  metrics:
+    tenantLabel: { mode: top, topN: 50 }
+  audit:
+    enabled: true
+    sink: stdout
+    sampleReads: 0.01
+
+# Secret values. Use existingSecret to bring your own Secret with the same keys.
+existingSecret: ""
+secrets:
+  upstreamPassword: ""
+  adminToken: ""
+  appNameSecret: ""
+
+service:
+  type: ClusterIP
+  port: 27018
+  annotations: {}
+
+adminService:
+  enabled: true
+  port: 9103
+
+resources:
+  requests: { cpu: 100m, memory: 128Mi }
+  limits: { memory: 512Mi }
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+extraVolumes: []
+extraVolumeMounts: []
+
+# Re-read the ConfigMap into a running pod by sending SIGHUP is not automatic;
+# the pod template carries a checksum so config changes roll the Deployment.
+# Set to false to reload in place instead (POST /v1/reload on the admin API).
+rollOnConfigChange: true
+
+pdb:
+  enabled: true
+  minAvailable: 1
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+networkPolicy:
+  enabled: false
+  # Pods/namespaces allowed to reach the proxy port.
+  clientFrom:
+    - namespaceSelector: {}
+  adminFrom: []
+  metricsFrom: []
+  # CIDR of the MongoDB deployment (egress); empty allows all egress on 27017.
+  mongoCIDR: ""
