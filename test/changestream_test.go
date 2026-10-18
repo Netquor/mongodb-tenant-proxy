@@ -185,6 +185,9 @@ func TestChangeStreamFanout(t *testing.T) {
 	var fan, direct int64
 	t.Run("fanout", func(t *testing.T) { fan = run(t, false) })
 	t.Run("private", func(t *testing.T) { direct = run(t, true) })
+	if fan == 0 && direct == 0 {
+		t.Skip("subtests skipped (upstream without change stream support)")
+	}
 	t.Logf("open upstream cursors for %d watchers: fan-out=%d, private=%d", tenants*perTenant, fan, direct)
 	if fan > 3 {
 		t.Fatalf("fan-out used %d upstream cursors for %d watchers", fan, tenants*perTenant)

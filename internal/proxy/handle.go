@@ -59,6 +59,10 @@ func (c *conn) handleMsg(h wire.Header, body []byte) error {
 		c.s.M.Command(name, "ok")
 		return c.reply(h, res.Reply)
 	}
+	if bad := changeStreamUnsupported(res, c.s.limits.maxWire); bad != nil {
+		c.s.M.Command(name, "error")
+		return c.reply(h, bad)
+	}
 	if res.Stream != nil && c.s.fan != nil {
 		if handled, err := c.openStream(h, m, res); handled || err != nil {
 			return err
