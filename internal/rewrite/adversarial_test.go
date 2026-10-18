@@ -329,7 +329,7 @@ func adversarialCases() []advCase {
 	add("stage/$planCacheStats", agg(M{"$planCacheStats": M{}}), true)
 	add("stage/$documents", agg(M{"$documents": A{M{"a": 1}}}), true)
 	add("stage/$search", agg(M{"$search": M{"text": M{"query": "x", "path": "a"}}}), false) // tenant filter injected
-	add("stage/$vectorSearch", agg(M{"$vectorSearch": M{}}), false) // tenant filter injected
+	add("stage/$vectorSearch", agg(M{"$vectorSearch": M{}}), false)                         // tenant filter injected
 	add("stage/$unknown", agg(M{"$nope": M{}}), true)
 	add("stage/$out not last", agg(M{"$out": "x"}, M{"$limit": 1}), true)
 	add("stage/$merge not last", agg(M{"$merge": "x"}, M{"$limit": 1}), true)

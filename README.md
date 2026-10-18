@@ -75,13 +75,61 @@ These commands run on the tenant's upstream connection and cannot take part in a
 
 MongoDB 8.0's cross-namespace `bulkWrite` (`client.bulkWrite` in current drivers) is supported with `ops`/`nsInfo` as document sequences or arrays. Each op is rewritten exactly like the single-collection handlers (inserts stamped, filters scoped, update operators/pipelines/replacements guarded, unknown op fields refused); each `nsInfo` namespace must be in an allowed database and not `system.*`/`__mtp_*`; a namespace that is the tenant's view is refused; `ordered` and `errorsOnly` are passed through. Cursors for large result sets are tracked like any other. Integration tests need mongod 8.0 and skip with a message otherwise.
 
-## Identifying the tenant (`auth.mode`)
+## Authentication (`auth.mode`)
 
-* **`scram`** – clients connect with `mongodb://user:pass@proxy/?authMechanism=SCRAM-SHA-256`; each user is bound to a tenant in the config. Generate entries with `MTP_PASSWORD=… mongodb-tenant-proxy hash-password -user acme -tenant acme`.
-* **`appname`** – tenant = the driver's `appName`. With `appNameSecret` set the name must be `<tenant>.<hmac>` (`mongodb-tenant-proxy sign-appname -secret … -tenant acme`); without it, the proxy must only be reachable by trusted services.
-* **`static`** – every connection belongs to `staticTenant` (one proxy/port per tenant, e.g. behind per-tenant network policy).
+`auth.mode` is a string or a **list** of mechanisms; `scram`, `scram-sha-1`, `x509` and `oidc` can be combined (`"mode": ["scram", "scram-sha-1", "x509", "oidc"]`) and are all advertised to drivers through `saslSupportedMechs` in `hello` (SCRAM mechanisms are filtered to the ones the named user has a credential for; unknown users get the full list so existence isn't revealed). `appname` and `static` stand alone.
 
-The proxy authenticates to MongoDB itself (SCRAM-SHA-256, optional TLS) and presents itself to drivers as a `mongos`, so drivers never discover and bypass it via replica-set member addresses.
+| mode | client connects with | tenant comes from |
+|---|---|---|
+| `scram` | `authMechanism=SCRAM-SHA-256` (the default negotiation) | the user's `tenantId` |
+| `scram-sha-1` | `authMechanism=SCRAM-SHA-1` (legacy MD5-digested password) | the user's `tenantId` |
+| `x509` | `authMechanism=MONGODB-X509`, client certificate | `auth.x509` rule matching the certificate |
+| `oidc` | `authMechanism=MONGODB-OIDC` with a machine (JWT) callback | a claim of the validated JWT |
+| `appname` | nothing; tenant = the driver's `appName` (`<tenant>` or `<tenant>.<hmac>` with `appNameSecret`, see `sign-appname`) | `appName` |
+| `static` | nothing; every connection belongs to `staticTenant` (one proxy per tenant) | config |
+
+**SCRAM.** Generate user entries with `MTP_PASSWORD=… mongodb-tenant-proxy hash-password -user acme -tenant acme [-mechanism sha256|sha1|both]`. `sha256` (default) writes the flat `salt/iterations/storedKey/serverKey` fields; `sha1` writes a nested `"sha1": {…}` credential (derived from `md5("<user>:mongo:<password>")`, as MongoDB does); `both` writes both so a user can use either. A user without a SCRAM-SHA-1 credential cannot log in with SCRAM-SHA-1 and vice versa. SCRAM-SHA-1 is weaker; enable it only for old drivers.
+
+**x.509.** Needs `clientTLS.clientCAFile` (mutual TLS): the listener verifies client certificates against that CA. If `x509` is the only mode a certificate is mandatory; combined with other modes it is optional, so password users keep working without one. Map certificates to tenants by subject (RFC 2253, compared case-insensitively) or by any SAN (DNS, e-mail, URI, IP):
+
+```json
+"clientTLS": { "certFile": "server.pem", "keyFile": "server.key", "clientCAFile": "client-ca.pem" },
+"auth": { "mode": "x509", "x509": [
+  { "subject": "CN=billing,O=acme", "tenantId": "acme" },
+  { "san": "reports.svc.example.com", "tenantId": "globex" } ] }
+```
+A trusted certificate with no matching rule is rejected. Connect with `?tls=true&tlsCAFile=…&tlsCertificateKeyFile=client.pem&authMechanism=MONGODB-X509&authSource=$external`.
+
+**OIDC / JWT.** `MONGODB-OIDC` machine flow: the client's callback returns a JWT and the proxy validates signature (RS256/384/512, ES256/384/512 against the JWKS, matched by `kid`; `none` and HMAC algorithms are refused), `iss`, `aud`, `exp`/`nbf` (with `clockSkew`), then takes the tenant from `tenantClaim` (a claim name, or a dotted path; default `tenant`). The human (browser) flow is not supported.
+
+```json
+"auth": { "mode": "oidc", "oidc": {
+  "issuer": "https://idp.example.com/", "audience": "mongo-proxy",
+  "jwksUri": "https://idp.example.com/.well-known/jwks.json",
+  "tenantClaim": "tenant", "clockSkew": "30s" } }
+```
+Use `jwksFile` for a static key set instead of `jwksUri`. A JWKS URI is cached (`jwksRefresh`, default 10m) and re-fetched at most every 30 s when an unknown `kid` appears, so key rotation works without restarts.
+
+### Upstream authentication
+
+`upstream.authMechanism` (or `?authMechanism=` in `upstream.uri`) selects how the proxy logs in to MongoDB:
+
+* `SCRAM-SHA-256` (default when a username is set) and `SCRAM-SHA-1`.
+* `MONGODB-X509` – the proxy's client certificate (`upstream.certFile`/`keyFile`, requires `upstream.tls`); `upstream.username` is optional (the subject is derived from the certificate). The matching `$external` user must exist in MongoDB.
+* `MONGODB-AWS` – SigV4-signed STS `GetCallerIdentity` handed to the server. Credentials come from `upstream.awsAccessKeyId`/`awsSecretAccessKey`/`awsSessionToken`, else `username`/`password`, else `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN`, else the ECS container endpoint (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`). EC2 instance-profile (IMDS) and web-identity/IRSA credentials are not implemented – export them as environment variables or run a refresher sidecar. The signature is verified against the official driver's, but the exchange has not been run against a real AWS-enabled mongod.
+
+The proxy presents itself to drivers as a `mongos`, so drivers never discover and bypass it via replica-set member addresses.
+
+## TLS
+
+* **Client side:** `clientTLS.certFile`/`keyFile` enables TLS on the listener (TLS 1.2+). Add `clientTLS.clientCAFile` to verify client certificates (required by `x509`, see above).
+* **Upstream:** `upstream.tls`, `upstream.caFile`, `upstream.insecureSkipVerify`, and `upstream.certFile`/`keyFile` for a client certificate (mutual TLS to mongod, needed for `MONGODB-X509`).
+
+## Wire compression
+
+`compressors` (top level) lists what the proxy advertises to clients in `hello`: any of `snappy`, `zlib`, `zstd`, in preference order (default none, so behaviour is unchanged). Drivers pick from the intersection (`compressors=zstd,snappy` / `SetCompressors`). Requests arrive as `OP_COMPRESSED` and are decompressed; replies are compressed with the compressor of the request they answer, as `mongod` does. `hello`, `saslStart`, `saslContinue`, `authenticate`, `createUser`, `updateUser` and the other handshake/auth commands are never compressed. A request using a compressor that was not advertised closes the connection, and declared uncompressed sizes are checked against `maxMessageBytes` before allocating.
+
+`upstream.compressors` negotiates compression to MongoDB independently of the client side: the proxy compresses the commands it forwards (never the handshake/auth ones) and mongod compresses the replies. When the upstream reply uses the same compressor the client expects and the proxy has nothing to rewrite in it, the compressed bytes are relayed untouched. Without compression on either side the forward path is the same raw-byte relay as before. Pure Go (`klauspost/compress` for snappy/zstd, stdlib zlib).
 
 ## Change streams
 
@@ -102,7 +150,7 @@ go build -o mongodb-tenant-proxy ./cmd/mongodb-tenant-proxy
 ./mongodb-tenant-proxy serve -config proxy.json
 ```
 
-See [`proxy.example.json`](proxy.example.json). Metrics (`/metrics`, Prometheus text) and `/healthz` are served on `metricsAddr`. Client-facing TLS: `clientTLS.certFile/keyFile`.
+See [`proxy.example.json`](proxy.example.json). Metrics (`/metrics`, Prometheus text) and `/healthz` are served on `metricsAddr`. TLS, authentication and compression options are described above.
 
 ## Performance
 
@@ -192,7 +240,7 @@ Rejections return `code: 8000`, `codeName: "TenantQuotaExceeded"` and a message 
 * Requests are validated before rewriting: malformed BSON, nesting deeper than 100 levels and pipelines longer than 1000 stages are rejected, and server-side JavaScript (`$where`, `$function`, `$accumulator`) is refused anywhere in a command when `disableJS` is set.
 * The `tenantId` field is visible in returned documents.
 * `listCollections` filters other than `name`/`type` don't apply to views.
-* No wire compression (not advertised), no `SCRAM-SHA-1`/x.509 on the client side.
+* Not supported: `GSSAPI`/`PLAIN`/LDAP client authentication, the interactive OIDC (human) flow, speculative authentication in `hello` (drivers fall back to a normal login), and `OP_COMPRESSED` for the legacy `OP_QUERY` handshake.
 * Session ids are bound to the first tenant that uses them ([Sessions](#sessions)); quotas are per proxy process, not shared between proxy replicas ([Quotas](#quotas-tenantlimits)).
 
 ## Tests
@@ -202,4 +250,4 @@ go test ./internal/...            # rewriter unit tests
 go test ./test/ -count=1          # integration: real mongod replica set + official Go driver
 go test ./test/ -bench FindOne -run xxx
 ```
-Integration tests start their own `mongod` (must be on `PATH`) and cover isolation for CRUD, aggregation stages, cursors, bulk writes, transactions, indexes, and all three auth modes including an auth-enabled upstream.
+Integration tests start their own `mongod` (must be on `PATH`) and cover isolation for CRUD, aggregation stages, cursors, bulk writes, transactions, indexes, and every auth mode (SCRAM-SHA-256/SHA-1, x.509 with generated certificates, OIDC/JWT, appname, static) including auth-enabled and TLS/x.509 upstreams, plus wire compression for each algorithm. `go test ./test/ -bench Compression -run xxx` compares compressors.

@@ -49,7 +49,7 @@ func TestValidateBodyRejectsBadNesting(t *testing.T) {
 
 func testConn(t *testing.T, mode string) *conn {
 	t.Helper()
-	a, err := auth.New(config.Auth{Mode: mode, StaticTenant: "T1"})
+	a, err := auth.New(config.Auth{Mode: config.Mode(mode), StaticTenant: "T1"})
 	if err != nil {
 		t.Fatal(err)
 	}

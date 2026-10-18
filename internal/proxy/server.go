@@ -19,6 +19,7 @@ import (
 	"github.com/netquor/mongodb-tenant-proxy/internal/metrics"
 	"github.com/netquor/mongodb-tenant-proxy/internal/rewrite"
 	"github.com/netquor/mongodb-tenant-proxy/internal/upstream"
+	"github.com/netquor/mongodb-tenant-proxy/internal/wire"
 )
 
 // Server accepts client connections and proxies them to the upstream.
@@ -33,6 +34,10 @@ type Server struct {
 	limits helloLimits
 	lim    *limits.Manager
 	sess   *sessionTable
+	// clientComp is the set of compressors advertised to clients, with
+	// clientCompList holding the names in preference order.
+	clientComp     map[wire.Compressor]bool
+	clientCompList []wire.Compressor
 
 	nextID atomic.Int64
 	mu     sync.Mutex
@@ -87,6 +92,13 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		IDPolicy:      cfg.Tenant.IDPolicy,
 		AtomicOut:     s.txnSupported,
 	})
+	s.clientComp = map[wire.Compressor]bool{}
+	for _, n := range cfg.Compressors {
+		if id, ok := wire.CompressorByName(n); ok && !s.clientComp[id] {
+			s.clientComp[id] = true
+			s.clientCompList = append(s.clientCompList, id)
+		}
+	}
 	if cs := cfg.ChangeStreams; !cs.Disabled && !cs.DisableFanout {
 		s.fan = fanout.NewManager(d, cfg.Tenant.Field, !cs.DisableAutoImages, cfg.MaxMessageBytes, log)
 	}

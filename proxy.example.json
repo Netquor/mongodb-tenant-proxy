@@ -12,6 +12,7 @@
     "overrides": { "acme": { "opsPerSec": 5000 } }
   },
   "databases": ["app"],
+  "compressors": ["zstd", "snappy", "zlib"],
   "auth": {
     "mode": "scram",
     "users": [
