@@ -209,7 +209,7 @@ See [`proxy.example.json`](proxy.example.json). Metrics (`/metrics`, Prometheus 
 ### Hot reload
 `kill -HUP <pid>` (or `systemctl reload`, or `POST /v1/reload` on the admin API) re-reads the config file. The file is fully validated first; on any error the running config is kept and the error is logged / returned (HTTP 422). Open connections are **not** dropped.
 
-Applied live: `auth.users`, `auth.appNameSecret`, `tenants`, `databases`, `denyCommands`, `disableJS`, `disableViews`, `maxConnsPerTenant`, `idleTimeout`, `maxMessageBytes`, `logLevel`, `audit.sampleReads`. Everything else (listen address, upstream, `tenant`, `auth.mode`, `clientTLS`, `changeStreams`, `store`, `audit` sink, `metricsAddr`, `adminAddr`) needs a restart – a reload that changes them applies the rest and lists them in `restartRequired`.
+Applied live: `auth.users`, `auth.appNameSecret`, `tenants`, `databases`, `denyCommands`, `disableJS`, `disableViews`, `maxConnsPerTenant`, `idleTimeout`, `connLimits`, `maxMessageBytes`, `logLevel`, `audit.sampleReads`. Everything else (listen address, upstream, `tenant`, `auth.mode`, `clientTLS`, `changeStreams`, `store`, `audit` sink, `metricsAddr`, `adminAddr`) needs a restart – a reload that changes them applies the rest and lists them in `restartRequired`.
 
 After every reload, and after every tenant/user change, live connections re-check their tenant: a connection whose tenant is disabled, or whose user was removed, is closed immediately (and re-checked before each subsequent command).
 

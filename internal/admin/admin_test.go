@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -201,23 +202,25 @@ func TestMutualTLS(t *testing.T) {
 }
 
 func TestTokenEqualAndOriginGuard(t *testing.T) {
-	want := []byte("0123456789abcdef-token")
-	if !tokenEqual("0123456789abcdef-token", want) || tokenEqual("0123456789abcdef-toke", want) || tokenEqual("", want) {
+	tok := "0123456789abcdef-token"
+	sum := sha256.Sum256([]byte(tok))
+	want := sum[:]
+	if !tokenEqual(tok, want) || tokenEqual("0123456789abcdef-toke", want) || tokenEqual("", want) {
 		t.Fatal("tokenEqual")
 	}
-	s, err := New(newFake(t), config.Admin{Token: string(want)})
+	s, err := New(newFake(t), config.Admin{Token: tok})
 	if err != nil {
 		t.Fatal(err)
 	}
 	req := httptest.NewRequest("POST", "/v1/reload", nil)
-	req.Header.Set("Authorization", "Bearer "+string(want))
+	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Origin", "https://evil.example")
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != 403 {
 		t.Fatalf("cross-origin POST = %d, want 403", rec.Code)
 	}
-	if rec := do(t, s.Handler(), "POST", "/v1/reload", "", string(want)); rec.Code != 200 {
+	if rec := do(t, s.Handler(), "POST", "/v1/reload", "", tok); rec.Code != 200 {
 		t.Fatalf("same-origin POST = %d, want 200", rec.Code)
 	}
 }

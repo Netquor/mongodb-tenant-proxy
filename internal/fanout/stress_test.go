@@ -33,7 +33,7 @@ func tkey(tenant string) string {
 
 var tsCounter atomic.Uint32
 
-func event(tenant string, seq int64, op string) bsoncore.Document {
+func stressEvent(tenant string, seq int64, op string) bsoncore.Document {
 	ts := tsCounter.Add(1)
 	d := []byte{}
 	d = bsoncore.AppendDocumentElement(d, "_id", bsoncore.BuildDocument(nil, bsoncore.AppendInt64Element(nil, "_data", int64(ts))))
@@ -106,7 +106,7 @@ func TestStressDispatchVsSubscribe(t *testing.T) {
 				for i := 0; i < 1+rng.Intn(4); i++ {
 					ten := tenants[rng.Intn(len(tenants))]
 					seq[ten]++
-					evs = append(evs, event(ten, seq[ten], "insert"))
+					evs = append(evs, stressEvent(ten, seq[ten], "insert"))
 				}
 				var tok bsoncore.Document
 				h.dispatch(batch(evs...), nil, &tok)
@@ -191,7 +191,7 @@ func TestStressOverflow(t *testing.T) {
 	for i := 0; i < maxQueue+500; i += 100 {
 		var evs []bsoncore.Document
 		for j := 0; j < 100; j++ {
-			evs = append(evs, event("a", int64(i+j+1), "insert"))
+			evs = append(evs, stressEvent("a", int64(i+j+1), "insert"))
 		}
 		h.dispatch(batch(evs...), nil, &tok)
 		for got.Load() < int64(i+100)-5000 { // keep `fast` within its queue
@@ -255,7 +255,7 @@ func TestStressFailAllVsDispatch(t *testing.T) {
 			if h == nil {
 				continue
 			}
-			h.dispatch(batch(event("t0", i, "insert"), event("t1", i, "drop"), event("t1", i, "invalidate")), nil, &tok)
+			h.dispatch(batch(stressEvent("t0", i, "insert"), stressEvent("t1", i, "drop"), stressEvent("t1", i, "invalidate")), nil, &tok)
 			if i%7 == 0 {
 				h.failAll(ErrOverflow)
 			}

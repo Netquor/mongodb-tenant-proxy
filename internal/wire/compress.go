@@ -59,7 +59,6 @@ const compressedHeader = 9
 
 var (
 	zstdEnc = mustZstdEncoder()
-	zstdDec = mustZstdDecoder()
 
 	zlibWriters sync.Pool
 	zlibReaders sync.Pool
@@ -71,14 +70,6 @@ func mustZstdEncoder() *zstd.Encoder {
 		panic(err)
 	}
 	return e
-}
-
-func mustZstdDecoder() *zstd.Decoder {
-	d, err := zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(256<<20))
-	if err != nil {
-		panic(err)
-	}
-	return d
 }
 
 // CompressorID returns the compressor used by an OP_COMPRESSED body without
@@ -128,9 +119,22 @@ func Compress(id Compressor, opcode int32, data []byte) ([]byte, error) {
 // ErrBadCompressed is returned for malformed OP_COMPRESSED bodies.
 var ErrBadCompressed = errors.New("wire: malformed OP_COMPRESSED")
 
+// snappyMaxRatio bounds how far snappy can expand: a 3-byte copy element
+// yields at most 64 bytes. A header claiming more than this per compressed
+// byte is lying and is refused before any buffer is allocated.
+const snappyMaxRatio = 22
+
+// zstdMaxWindow bounds the history buffer a zstd frame may demand.
+const zstdMaxWindow = 16 << 20
+
+var zstdReaders sync.Pool
+
 // Decompress unwraps an OP_COMPRESSED body. maxSize bounds the declared
-// uncompressed size (0 = unlimited); the declared size is verified, so a
-// hostile peer cannot make the proxy allocate more than maxSize.
+// uncompressed size (0 = unlimited). The declared size is only a claim: the
+// output buffer grows with the bytes the decompressor really produces and the
+// stream must end exactly at the claimed size, so neither a tiny body that
+// declares a huge size nor a decompression bomb makes the proxy allocate more
+// than the (verified) declared size, which is itself capped by maxSize.
 func Decompress(body []byte, maxSize int) (opcode int32, id Compressor, data []byte, err error) {
 	if len(body) < compressedHeader {
 		return 0, 0, nil, ErrBadCompressed
@@ -147,15 +151,29 @@ func Decompress(body []byte, maxSize int) (opcode int32, id Compressor, data []b
 	}
 	switch id {
 	case CompNone:
+		if len(src) != size {
+			return 0, id, nil, ErrBadCompressed
+		}
 		data = src
 	case CompSnappy:
 		n, derr := snappy.DecodedLen(src)
-		if derr != nil || n != size {
+		if derr != nil || n != size || size > snappyMaxRatio*len(src)+64 {
 			return 0, id, nil, ErrBadCompressed
 		}
 		data, err = snappy.Decode(make([]byte, size), src)
 	case CompZstd:
-		data, err = zstdDec.DecodeAll(src, make([]byte, 0, size))
+		zr, _ := zstdReaders.Get().(*zstd.Decoder)
+		if zr == nil {
+			zr, err = zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(zstdMaxWindow))
+			if err != nil {
+				return 0, id, nil, err
+			}
+		}
+		if err = zr.Reset(bytes.NewReader(src)); err == nil {
+			data, err = readExact(zr, size)
+		}
+		zr.Reset(nil)
+		zstdReaders.Put(zr)
 	case CompZlib:
 		zr, _ := zlibReaders.Get().(io.ReadCloser)
 		if zr == nil {
@@ -166,15 +184,7 @@ func Decompress(body []byte, maxSize int) (opcode int32, id Compressor, data []b
 		if err != nil {
 			return 0, id, nil, err
 		}
-		data = make([]byte, size)
-		_, err = io.ReadFull(zr, data)
-		if err == nil {
-			// Anything beyond the declared size is a lie about the size.
-			var one [1]byte
-			if n, _ := zr.Read(one[:]); n != 0 {
-				err = ErrBadCompressed
-			}
-		}
+		data, err = readExact(zr, size)
 		zlibReaders.Put(zr)
 	default:
 		return 0, id, nil, fmt.Errorf("wire: unsupported compressor %d", id)
@@ -186,6 +196,20 @@ func Decompress(body []byte, maxSize int) (opcode int32, id Compressor, data []b
 		return 0, id, nil, ErrBadCompressed
 	}
 	return opcode, id, data, nil
+}
+
+// readExact reads a stream that must hold exactly n bytes.
+func readExact(r io.Reader, n int) ([]byte, error) {
+	data, err := readBody(r, n)
+	if err != nil {
+		return nil, ErrBadCompressed
+	}
+	// Anything beyond the declared size is a lie about the size.
+	var one [1]byte
+	if m, _ := r.Read(one[:]); m != 0 {
+		return nil, ErrBadCompressed
+	}
+	return data, nil
 }
 
 // Compressible reports whether MongoDB permits compressing a command. The

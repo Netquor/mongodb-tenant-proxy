@@ -9,6 +9,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
 
+	"github.com/netquor/mongodb-tenant-proxy/internal/audit"
 	"github.com/netquor/mongodb-tenant-proxy/internal/auth"
 	"github.com/netquor/mongodb-tenant-proxy/internal/rewrite"
 	"github.com/netquor/mongodb-tenant-proxy/internal/upstream"
@@ -350,6 +351,9 @@ func (c *conn) helloDoc(legacy bool) bsoncore.Document {
 func (c *conn) hello(req bsoncore.Document) bsoncore.Document {
 	if c.s.auth.Has("appname") && c.tenant == nil {
 		if name, ok := wire.LookupPath(req, "client", "application", "name").StringValueOK(); ok {
+			if c.lockedOut("") {
+				return authFailed()
+			}
 			id, err := c.s.auth.ResolveAppName(name)
 			if err == nil {
 				err = c.bindTenant(id)
@@ -358,7 +362,11 @@ func (c *conn) hello(req bsoncore.Document) bsoncore.Document {
 				}
 			}
 			if err != nil {
-				c.authFail("", "appName authentication failed")
+				if errors.Is(err, auth.ErrAuthFailed) {
+					c.authFail("", "appName authentication failed")
+				} else {
+					c.auditAuthFail("", "appName accepted but tenant unavailable: "+err.Error())
+				}
 				c.log.Warn("appName authentication failed", "err", err)
 				return errorDoc(18, "AuthenticationFailed", "Authentication failed.")
 			}
@@ -431,7 +439,7 @@ func (c *conn) handleLegacy(h wire.Header, body []byte) error {
 	default:
 		resp = errorDoc(59, "CommandNotFound", "tenant proxy: only the handshake may use OP_QUERY")
 	}
-	return wire.WriteFrame(c.nc, c.nextRequestID(), h.RequestID, wire.OpReply, wire.EncodeReply(resp))
+	return wire.WriteFrame(c.out(), c.nextRequestID(), h.RequestID, wire.OpReply, wire.EncodeReply(resp))
 }
 
 // ---- client authentication ----------------------------------------------
@@ -465,6 +473,28 @@ func (c *conn) authenticated(tenant string) error {
 	return nil
 }
 
+// clip bounds client-supplied text echoed back in an error message.
+func clip(s string) string {
+	if len(s) > 40 {
+		return s[:40] + "…"
+	}
+	return s
+}
+
+// lockedOut refuses an authentication attempt from a client (or for a user)
+// that has failed too often, and drops the connection after the reply. The
+// reply is the ordinary failure so a lockout is not an oracle for anything.
+func (c *conn) lockedOut(user string) bool {
+	if !c.s.authLocked(c.ip, user) {
+		return false
+	}
+	e := c.event(audit.AuthFailure)
+	e.Reason = "locked out after repeated authentication failures"
+	c.s.audit.Log(e)
+	c.closeAfter = true
+	return true
+}
+
 func (c *conn) handleSASL(name string, cmd bsoncore.Document) bsoncore.Document {
 	fail := func() bsoncore.Document {
 		c.sasl = nil
@@ -475,6 +505,17 @@ func (c *conn) handleSASL(name string, cmd bsoncore.Document) bsoncore.Document 
 		return errorDoc(59, "CommandNotFound", "tenant proxy: authentication is not enabled; the tenant is determined by the proxy")
 	}
 	_, payload, _ := cmd.Lookup("payload").BinaryOK()
+	if name == "saslContinue" {
+		// Every conversation here has id 1 (saslReply); anything else is a
+		// client mixing up or forging conversations.
+		if id, ok := cmd.Lookup("conversationId").AsInt64OK(); !ok || id != 1 {
+			c.sasl = nil
+			return errorDoc(17, "ProtocolError", "tenant proxy: invalid conversationId")
+		}
+	}
+	if c.lockedOut(c.saslUserFor(name, payload)) {
+		return authFailed()
+	}
 	if name == "saslStart" {
 		mech, _ := cmd.Lookup("mechanism").StringValueOK()
 		switch mech {
@@ -487,14 +528,14 @@ func (c *conn) handleSASL(name string, cmd bsoncore.Document) bsoncore.Document 
 			var err error
 			c.sasl, out, err = c.s.auth.StartSASL(mech, payload, skip)
 			if errors.Is(err, auth.ErrMechanismUnavailable) {
-				return errorDoc(334, "MechanismUnavailable", "tenant proxy: "+mech+" is not enabled")
+				return errorDoc(334, "MechanismUnavailable", "tenant proxy: "+clip(mech)+" is not enabled")
 			}
 			if err != nil {
 				return fail()
 			}
 			return saslReply(false, out)
 		}
-		return errorDoc(334, "MechanismUnavailable", "tenant proxy: unsupported mechanism "+mech)
+		return errorDoc(334, "MechanismUnavailable", "tenant proxy: unsupported mechanism "+clip(mech))
 	}
 	if c.sasl == nil {
 		return fail()
@@ -504,16 +545,28 @@ func (c *conn) handleSASL(name string, cmd bsoncore.Document) bsoncore.Document 
 		return fail()
 	}
 	if c.sasl.Authenticated() {
-		c.setUser(c.sasl.Username())
 		if err := c.authenticated(c.sasl.Tenant()); err != nil {
 			c.log.Warn("tenant bind failed", "err", err)
-			return fail()
+			c.sasl = nil
+			c.auditAuthFail(c.saslUser, "tenant unavailable: "+err.Error())
+			return authFailed()
 		}
+		c.setUser(c.sasl.Username())
 	}
 	if done {
 		c.sasl = nil
 	}
 	return saslReply(done, out)
+}
+
+// saslUserFor names the user an authentication message is about, for the
+// per-user lockout: the one in saslStart's client-first message, and for
+// later messages the one remembered from it.
+func (c *conn) saslUserFor(cmd string, payload []byte) string {
+	if cmd == "saslStart" {
+		return saslUser(payload)
+	}
+	return c.saslUser
 }
 
 // handleOIDC completes MONGODB-OIDC's machine flow: the client sends
@@ -522,6 +575,7 @@ func (c *conn) handleOIDC(payload []byte) bsoncore.Document {
 	tok, ok := bsoncore.Document(payload).Lookup("jwt").StringValueOK()
 	if !ok || tok == "" {
 		c.log.Warn("oidc authentication failed", "err", "no jwt in payload (only the machine flow is supported)")
+		c.authFail("", "oidc: no token")
 		return authFailed()
 	}
 	tenant, err := c.s.auth.OIDC(tok)
@@ -530,6 +584,7 @@ func (c *conn) handleOIDC(payload []byte) bsoncore.Document {
 	}
 	if err != nil {
 		c.log.Warn("oidc authentication failed", "err", err)
+		c.authFail("", "oidc: invalid token")
 		return authFailed()
 	}
 	return saslReply(true, []byte{})
@@ -540,13 +595,17 @@ func (c *conn) handleOIDC(payload []byte) bsoncore.Document {
 func (c *conn) handleAuthenticate(cmd bsoncore.Document) bsoncore.Document {
 	mech, _ := cmd.Lookup("mechanism").StringValueOK()
 	if mech != auth.MechX509 {
-		return errorDoc(334, "MechanismUnavailable", "tenant proxy: unsupported mechanism "+mech)
+		return errorDoc(334, "MechanismUnavailable", "tenant proxy: unsupported mechanism "+clip(mech))
 	}
 	if !c.s.auth.Has("x509") {
 		return errorDoc(334, "MechanismUnavailable", "tenant proxy: MONGODB-X509 is not enabled")
 	}
+	if c.lockedOut("") {
+		return authFailed()
+	}
 	tc, ok := c.nc.(*tls.Conn)
 	if !ok {
+		c.authFail("", "x509: connection is not TLS")
 		return authFailed()
 	}
 	state := tc.ConnectionState()
@@ -557,6 +616,7 @@ func (c *conn) handleAuthenticate(cmd bsoncore.Document) bsoncore.Document {
 	}
 	if err != nil {
 		c.log.Warn("x509 authentication failed", "err", err)
+		c.authFail("", "x509: certificate not accepted")
 		return authFailed()
 	}
 	return bsoncore.BuildDocument(nil,

@@ -61,11 +61,13 @@ type Config struct {
 	// Path is the file the config was loaded from (set by Load; used by reload).
 	Path string `json:"-"`
 
-	MaxMessageBytes   int    `json:"maxMessageBytes,omitempty"`
-	MaxConnsPerTenant int    `json:"maxConnsPerTenant,omitempty"`
-	IdleTimeout       string `json:"idleTimeout,omitempty"`
-	MetricsAddr       string `json:"metricsAddr,omitempty"`
-	LogLevel          string `json:"logLevel,omitempty"`
+	MaxMessageBytes   int `json:"maxMessageBytes,omitempty"`
+	MaxConnsPerTenant int `json:"maxConnsPerTenant,omitempty"`
+	// ConnLimits bounds connection floods and slow clients (see ConnLimits).
+	ConnLimits  ConnLimits `json:"connLimits,omitempty"`
+	IdleTimeout string     `json:"idleTimeout,omitempty"`
+	MetricsAddr string     `json:"metricsAddr,omitempty"`
+	LogLevel    string     `json:"logLevel,omitempty"`
 }
 
 // ChangeStreams configures change stream support, which is on by default.
@@ -345,6 +347,8 @@ type Auth struct {
 	Users         []User     `json:"users,omitempty"`
 	X509          []X509Rule `json:"x509,omitempty"`
 	OIDC          *OIDC      `json:"oidc,omitempty"`
+	// BruteForce locks out clients that keep failing to authenticate.
+	BruteForce BruteForce `json:"bruteForce,omitempty"`
 }
 
 // User is a SCRAM credential bound to a tenant. The flat fields are the
@@ -516,6 +520,9 @@ func (c *Config) finish() error {
 				return err
 			}
 		}
+	}
+	if err := c.finishHardening(); err != nil {
+		return err
 	}
 	return c.finishOps()
 }

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
@@ -37,6 +38,17 @@ func (c *conn) admit(name string, m *wire.Msg, size int) (release func(), errDoc
 		c.s.M.Command(name, "denied")
 		c.log.Warn("session rejected", "command", name)
 		return nil, errorDoc(13, "Unauthorized", msg)
+	}
+
+	// Each tracked cursor is state kept for the connection's life; past the
+	// cap a cursor would be opened upstream untracked (and so never killed
+	// when the client goes away). Refuse before it exists.
+	switch name {
+	case "find", "aggregate", "listIndexes", "listCollections":
+		if len(c.cursors) >= maxCursorsPerConn {
+			c.s.M.Command(name, "denied")
+			return nil, quotaErrorDoc(fmt.Sprintf("tenant proxy: more than %d open cursors on this connection; close some first", maxCursorsPerConn))
+		}
 	}
 
 	lt := c.lim

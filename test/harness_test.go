@@ -285,6 +285,7 @@ func startReplSet(t testing.TB) []string {
 
 // setupRS starts a 3-node replica set and a proxy that discovers it from all
 // three members.
+//
 //lint:ignore U1000 kept for the HA suites on sibling branches
 func setupRS(t testing.TB, mutate func(*config.Config)) *env {
 	t.Helper()

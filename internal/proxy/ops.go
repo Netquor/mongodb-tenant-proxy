@@ -31,6 +31,7 @@ type runtime struct {
 	maxMessage   int
 	disableViews bool
 	tracing      bool
+	cl           config.ConnLimits
 }
 
 func (s *Server) newRuntime(cfg *config.Config) *runtime {
@@ -49,6 +50,7 @@ func (s *Server) newRuntime(cfg *config.Config) *runtime {
 		maxMessage:   cfg.MaxMessageBytes,
 		disableViews: cfg.DisableViews,
 		tracing:      cfg.Tracing.Enabled,
+		cl:           cfg.ConnLimits,
 	}
 }
 
@@ -210,6 +212,7 @@ func restartRequired(old, cur *config.Config) []string {
 	chk("tenant", old.Tenant, cur.Tenant)
 	chk("auth.mode", old.Auth.Mode, cur.Auth.Mode)
 	chk("auth.staticTenant", old.Auth.StaticTenant, cur.Auth.StaticTenant)
+	chk("auth.bruteForce", old.Auth.BruteForce, cur.Auth.BruteForce)
 	chk("changeStreams", old.ChangeStreams, cur.ChangeStreams)
 	chk("metricsAddr", old.MetricsAddr, cur.MetricsAddr)
 	chk("adminAddr", old.AdminAddr, cur.AdminAddr)
@@ -376,6 +379,14 @@ func (c *conn) authOK() {
 }
 
 func (c *conn) authFail(user, reason string) {
+	c.s.authFailed(c.ip, user)
+	c.auditAuthFail(user, reason)
+}
+
+// auditAuthFail records a refused authentication that is not a credential
+// guess (the tenant is disabled or at its connection cap), so it does not
+// count towards a lockout.
+func (c *conn) auditAuthFail(user, reason string) {
 	e := c.event(audit.AuthFailure)
 	if user != "" {
 		e.User = user

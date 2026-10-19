@@ -44,6 +44,10 @@ type jwkKey struct {
 const (
 	minJWKSRetry = 30 * time.Second
 	maxJWKSBytes = 1 << 20
+	// maxTokenBytes bounds a bearer token. Real access tokens are a few KB;
+	// without a cap a client could make the proxy base64- and JSON-decode
+	// tens of megabytes per attempt before authenticating.
+	maxTokenBytes = 16 * 1024
 )
 
 // jwksRedirect keeps a redirecting JWKS endpoint from downgrading to cleartext
@@ -63,7 +67,13 @@ func newOIDCVerifier(c *config.OIDC) (*oidcVerifier, error) {
 		return nil, errors.New("auth.oidc is required")
 	}
 	v := &oidcVerifier{cfg: *c, claim: c.TenantClaim, skew: 30 * time.Second, refresh: 10 * time.Minute,
-		client: &http.Client{Timeout: 10 * time.Second, CheckRedirect: jwksRedirect}}
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+			// The key set is fetched from the configured URL only: a
+			// redirect would let whoever controls that host point the
+			// proxy at internal services (SSRF).
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		}}
 	if v.claim == "" {
 		v.claim = "tenant"
 	}
@@ -196,15 +206,18 @@ func (v *oidcVerifier) candidates(kid string) []crypto.PublicKey {
 // keysFor returns the keys that may verify a token, refreshing the set when
 // it is stale or the key id is unknown (rotation), at most every 30s.
 func (v *oidcVerifier) keysFor(kid string) []crypto.PublicKey {
+	ks := v.candidates(kid)
 	v.mu.Lock()
 	stale := v.keys == nil || time.Since(v.fetchedAt) > v.refresh
-	canTry := time.Since(v.lastTry) > minJWKSRetry || v.lastTry.IsZero()
+	// Claim the retry slot before fetching: otherwise every connection that
+	// arrives while a slow fetch is in flight starts its own.
+	canTry := (stale || len(ks) == 0) && (v.lastTry.IsZero() || time.Since(v.lastTry) > minJWKSRetry)
+	if canTry {
+		v.lastTry = time.Now()
+	}
 	v.mu.Unlock()
-	ks := v.candidates(kid)
-	if (stale || len(ks) == 0) && canTry {
-		if v.reload() == nil {
-			ks = v.candidates(kid)
-		}
+	if canTry && v.reload() == nil {
+		ks = v.candidates(kid)
 	}
 	return ks
 }
@@ -217,6 +230,9 @@ var jwtAlgs = map[string]crypto.Hash{
 // Verify checks signature, issuer, audience and validity window, and returns
 // the tenant id from the configured claim.
 func (v *oidcVerifier) Verify(token string, now time.Time) (string, error) {
+	if len(token) > maxTokenBytes {
+		return "", ErrAuthFailed
+	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return "", ErrAuthFailed
@@ -262,6 +278,9 @@ func (v *oidcVerifier) Verify(token string, now time.Time) (string, error) {
 	}
 	if nbf, ok := claims["nbf"].(float64); ok && now.Add(v.skew).Before(time.Unix(int64(nbf), 0)) {
 		return "", ErrAuthFailed
+	}
+	if iat, ok := claims["iat"].(float64); ok && now.Add(v.skew).Before(time.Unix(int64(iat), 0)) {
+		return "", ErrAuthFailed // issued in the future
 	}
 	tenant := claimString(claims, v.claim)
 	if tenant == "" || len(tenant) > 256 {

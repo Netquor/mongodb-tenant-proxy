@@ -26,6 +26,10 @@ type Admin struct {
 	// present a certificate signed by that CA (mTLS); a valid client
 	// certificate is sufficient authentication on its own.
 	TLS *AdminTLS `json:"tls,omitempty"`
+	// RatePerSec limits authenticated requests per second across all
+	// callers (default 50, negative = unlimited); failed authentications
+	// are throttled per client address separately.
+	RatePerSec float64 `json:"ratePerSec,omitempty"`
 }
 
 // AdminTLS is the admin listener's TLS configuration.
