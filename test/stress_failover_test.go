@@ -15,6 +15,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 
+	"github.com/netquor/mongodb-tenant-proxy/internal/config"
 	"github.com/netquor/mongodb-tenant-proxy/internal/stresstest"
 )
 
@@ -29,9 +30,15 @@ import (
 // gone every pooled upstream connection is back in the pool (InUse == 0) and
 // nothing of the proxy's keeps running after shutdown.
 func TestStressFailover(t *testing.T) {
+	for _, mode := range []string{"pooled", "dedicated"} {
+		t.Run(mode, func(t *testing.T) { stressFailover(t, mode) })
+	}
+}
+
+func stressFailover(t *testing.T, mode string) {
 	defer stresstest.Watchdog(t, 8*time.Minute)()
 	t.Cleanup(stresstest.NoLeak(t, 20))
-	e := setupRS(t, nil)
+	e := setupRS(t, func(c *config.Config) { c.Upstream.Pool.Mode = mode })
 	tenants := []string{"fa", "fb"}
 	const db = "fo"
 
@@ -230,20 +237,44 @@ func TestStressFailover(t *testing.T) {
 		}()
 	}
 
+	// one direct client per member, reused (e.primaryIndex builds a new client
+	// per probe and keeps them all until the test ends)
+	var members []*mongo.Client
+	for i := range e.rs {
+		members = append(members, e.member(t, i))
+	}
+	primary := func() int {
+		for i, c := range members {
+			cx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			var h bson.M
+			err := c.Database("admin").RunCommand(cx, bson.D{{Key: "hello", Value: 1}}).Decode(&h)
+			cancel()
+			if err == nil && h["isWritablePrimary"] == true {
+				return i
+			}
+		}
+		return -1
+	}
+
 	rounds := stresstest.N(2, 12)
 	for r := 0; r < rounds; r++ {
 		time.Sleep(2 * time.Second)
-		before := e.primaryIndex(t)
+		before := primary()
 		if before < 0 {
 			continue
 		}
-		pc := e.member(t, before)
+		pc := members[before]
 		err := pc.Database("admin").RunCommand(context.Background(),
 			bson.D{{Key: "replSetStepDown", Value: 10}, {Key: "force", Value: true}}).Err()
 		if err != nil && !mongo.IsNetworkError(err) {
 			t.Errorf("stepDown: %v", err)
 		}
-		eventually(t, 40*time.Second, "a new primary", func() bool { n := e.primaryIndex(t); return n >= 0 && n != before })
+		// Any primary will do: the step-down window (10s) is short enough that
+		// the higher-priority member may win the next election again.
+		stepped := time.Now()
+		eventually(t, 60*time.Second, "a primary after step-down", func() bool {
+			return time.Since(stepped) > time.Second && primary() >= 0
+		})
 	}
 	time.Sleep(2 * time.Second)
 	close(stop)
