@@ -6,6 +6,7 @@ require (
 	github.com/klauspost/compress v1.20.3
 	github.com/xdg-go/scram v1.2.0
 	go.mongodb.org/mongo-driver/v2 v2.9.2
+	go.uber.org/goleak v1.3.0
 )
 
 require (

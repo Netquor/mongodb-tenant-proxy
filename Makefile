@@ -6,7 +6,7 @@ DATE     ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS  := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)
 IMAGE    ?= ghcr.io/netquor/$(BINARY)
 
-.PHONY: build test test-race vet lint security security-tools docker docker-push helm-lint helm-template install clean
+.PHONY: build test test-race stress stress-long vet lint security security-tools docker docker-push helm-lint helm-template install clean
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/$(BINARY) $(PKG)
@@ -16,6 +16,15 @@ test:
 
 test-race:
 	go test ./... -race
+
+# Concurrency stress suite (internal/*/stress_test.go, test/stress_*_test.go).
+# Short mode is part of plain `go test ./...`; this repeats it under -race
+# across GOMAXPROCS settings. stress-long is the soak variant (MTP_STRESS=long).
+stress:
+	go test ./internal/... ./test -race -run 'Stress|TestManagerClose' -count=$(or $(COUNT),3) -cpu 1,4,8
+
+stress-long:
+	MTP_STRESS=long go test ./internal/... ./test -race -run 'Stress|TestManagerClose' -count=$(or $(COUNT),1) -cpu 4 -timeout 60m
 
 vet:
 	go vet ./...

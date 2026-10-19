@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -58,7 +57,7 @@ func setupOps(t *testing.T, mutate func(*config.Config)) *opsEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := proxy.New(loaded, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	srv, err := proxy.New(loaded, testLogger(t))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -23,6 +23,37 @@ import (
 	"github.com/netquor/mongodb-tenant-proxy/internal/wire"
 )
 
+// Lock ordering
+//
+// Every mutex in internal/ and where it nests (outer -> inner). Anything not
+// listed is a leaf: nothing else is acquired while it is held. The stress
+// suite (-race, test/stress_*_test.go, internal/*/stress_test.go) exercises
+// each of these edges concurrently.
+//
+//	Server.reloadMu  -> tenants.Registry.mu (SetStatic, released before OnChange)
+//	                 -> then, with no lock held, Server.enforce -> Server.mu
+//	                 (reload hooks run under reloadMu and must not call Reload)
+//	Server.mu        leaf. enforce/Connections/tenantGauges only read atomics
+//	                 and the lock-free tenants snapshot while holding it.
+//	Server.opsMu     leaf ($currentOp attribution map).
+//	tenants.Registry.mu -> Store implementation (FileStore.mu / MongoStore I/O);
+//	                 readers use an atomic snapshot and never take it. The
+//	                 onChange callback runs after Registry.mu is released.
+//	metrics.Registry.tmu -> metrics.labeler.mu; Registry.mu, Tenant.mu leaves.
+//	                 The gauge source (-> Server.mu) is called with no metrics
+//	                 lock held.
+//	audit.Logger.mu  -> sink mutex (FileSink/HTTPSink/syslog). Server code
+//	                 never logs while holding Server.mu.
+//	fanout.Manager.mu -> fanout.hub.mu -> fanout.Sub.mu (see fanout.go).
+//	upstream topology.mu -> memberPool.mu (removeMemberLocked clears the pool);
+//	                 the pool never calls into the topology while holding mu.
+//	limits.Manager (sync.Map), limits bucket.mu, limits.Tenant.mu,
+//	sessionTable.mu, upstream.Dialer.* : leaves.
+//
+// Per-connection state (conn.*, cursors, streams, txn pins) is owned by the
+// connection's goroutine; other goroutines reach it only through the atomics
+// in connOps (killed, tenantP, userP, nCursors, ...) and conn.nc.Close.
+
 // Server accepts client connections and proxies them to the upstream.
 type Server struct {
 	cfg  *config.Config
@@ -91,7 +122,16 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 			s.clientCompList = append(s.clientCompList, id)
 		}
 	}
+	// New owns d, the registry store and the audit sink from here on: every
+	// failing return below must release them (each holds goroutines, sockets
+	// or file handles), or a failed start - e.g. an unreachable upstream, as
+	// seen in a restart loop - leaks them.
 	if err := s.initOps(context.Background(), cfg); err != nil {
+		d.Close()
+		s.audit.Close()
+		if s.reg != nil {
+			s.reg.Close()
+		}
 		return nil, err
 	}
 	if cs := cfg.ChangeStreams; !cs.Disabled && !cs.DisableFanout {
@@ -102,7 +142,12 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 	d.SetLogger(log)
 	h, err := d.Hello(ctx)
 	if err != nil {
+		if s.fan != nil {
+			s.fan.Close()
+		}
 		d.Close()
+		s.audit.Close()
+		s.reg.Close()
 		return nil, fmt.Errorf("probing upstream %s: %w", cfg.Upstream.Addr, err)
 	}
 	get := func(k string, def int32) int32 {
@@ -167,6 +212,9 @@ func (s *Server) shutdown() {
 	}
 	s.mu.Unlock()
 	s.wg.Wait()
+	if s.fan != nil {
+		s.fan.Close() // before the dialer: stops hub streams and their reconnect loops
+	}
 	s.dial.Close()
 	s.audit.Close()
 	s.reg.Close()

@@ -3,8 +3,6 @@ package test
 import (
 	"context"
 	"fmt"
-	"io"
-	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -166,10 +164,7 @@ func setupWith(t testing.TB, withAuth bool, mutate func(*config.Config)) *env {
 	if cfg.MaxMessageBytes == 0 {
 		cfg.MaxMessageBytes = 48 << 20
 	}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	if os.Getenv("MTP_TEST_LOG") != "" {
-		log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	}
+	log := testLogger(t)
 	srv, err := proxy.New(cfg, log)
 	if err != nil {
 		t.Fatal(err)
@@ -316,10 +311,7 @@ func attachProxy(t testing.TB, addrs []string, mutate func(*config.Config)) *env
 	if mutate != nil {
 		mutate(cfg)
 	}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	if os.Getenv("MTP_TEST_LOG") != "" {
-		log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	}
+	log := testLogger(t)
 	srv, err := proxy.New(cfg, log)
 	if err != nil {
 		t.Fatal(err)

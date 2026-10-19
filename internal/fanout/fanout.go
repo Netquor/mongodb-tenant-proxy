@@ -33,6 +33,9 @@ const (
 // private, server-filtered stream from its last token.
 var ErrOverflow = errors.New("change stream subscriber too slow")
 
+// errClosed is returned to subscribers of a hub that was shut down.
+var errClosed = errors.New("change stream fan-out closed")
+
 // Timestamp is a BSON timestamp.
 type Timestamp struct{ T, I uint32 }
 
@@ -53,13 +56,22 @@ type Manager struct {
 	Log        *slog.Logger
 	MaxMessage int
 
-	mu   sync.Mutex
-	hubs map[string]*hub
+	// idleGrace is how long an unwatched hub keeps its stream (tests shorten it).
+	idleGrace time.Duration
+
+	// Lock order (outer -> inner): Manager.mu -> hub.mu -> Sub.mu.
+	// No path takes them in any other order: Subscribe releases Manager.mu
+	// before hub.add; Sub methods release Sub.mu before calling into the hub;
+	// hub.run releases hub.mu before taking Manager.mu.
+	mu     sync.Mutex
+	hubs   map[string]*hub
+	closed bool
+	wg     sync.WaitGroup // hub.run goroutines
 }
 
 // NewManager creates a Manager.
 func NewManager(d *upstream.Dialer, field string, autoImages bool, maxMessage int, log *slog.Logger) *Manager {
-	return &Manager{Dial: d, Field: field, AutoImages: autoImages, MaxMessage: maxMessage, Log: log, hubs: map[string]*hub{}}
+	return &Manager{Dial: d, Field: field, AutoImages: autoImages, MaxMessage: maxMessage, Log: log, hubs: map[string]*hub{}, idleGrace: hubIdleGrace}
 }
 
 // ActiveHubs reports the number of upstream streams currently open.
@@ -67,6 +79,30 @@ func (m *Manager) ActiveHubs() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.hubs)
+}
+
+// Close shuts every hub down: upstream streams are cancelled, their goroutines
+// exit and subscribers fail. Without it a hub (and its upstream connection)
+// outlives the server until its idle grace period ends - never, if it still
+// has subscribers or is retrying a broken stream.
+func (m *Manager) Close() {
+	m.mu.Lock()
+	m.closed = true
+	hubs := m.hubs
+	m.hubs = map[string]*hub{}
+	m.mu.Unlock()
+	for _, h := range hubs {
+		h.mu.Lock()
+		h.closed = true
+		if h.idle != nil {
+			h.idle.Stop()
+			h.idle = nil
+		}
+		h.mu.Unlock()
+		h.cancel()
+		h.failAll(errClosed)
+	}
+	m.wg.Wait() // hubs kill their upstream cursors before returning
 }
 
 // TenantKey is the routing key for a tenant value.
@@ -81,7 +117,13 @@ func (m *Manager) Subscribe(db, coll, tenantKey string, o Options) *Sub {
 		h := m.hubs[db+"."+coll]
 		if h == nil {
 			h = newHub(m, db, coll)
-			m.hubs[db+"."+coll] = h
+			if m.closed {
+				// Shutting down: hand out a subscriber whose Start fails
+				// instead of starting an upstream stream nobody will stop.
+				h.cancel()
+			} else {
+				m.hubs[db+"."+coll] = h
+			}
 		}
 		m.mu.Unlock()
 		if s := h.add(tenantKey, o); s != nil {
@@ -166,7 +208,7 @@ func (h *hub) remove(s *Sub) {
 		h.n--
 	}
 	if h.n == 0 && !h.closed && h.idle == nil {
-		h.idle = time.AfterFunc(hubIdleGrace, h.shutdownIfIdle)
+		h.idle = time.AfterFunc(h.m.idleGrace, h.shutdownIfIdle)
 	}
 }
 
@@ -188,16 +230,22 @@ func (h *hub) shutdownIfIdle() {
 // start launches the upstream stream (once), beginning at `at`, and waits
 // until it is open.
 func (h *hub) start(at Timestamp) error {
+	if h.ctx.Err() != nil {
+		return errClosed
+	}
 	h.mu.Lock()
 	if !h.started {
 		h.started = true
-		go h.run(at)
+		h.m.wg.Add(1)
+		go func() { defer h.m.wg.Done(); h.run(at) }()
 	}
 	h.mu.Unlock()
+	timeout := time.NewTimer(20 * time.Second)
+	defer timeout.Stop()
 	select {
 	case <-h.ready:
 		return h.openErr
-	case <-time.After(20 * time.Second):
+	case <-timeout.C:
 		return errors.New("timed out opening change stream")
 	}
 }
@@ -226,6 +274,9 @@ func (h *hub) run(first Timestamp) {
 			close(h.ready)
 		}
 	}
+	// However run ends, a subscriber still waiting for the first open must
+	// not sit out the 20s timeout.
+	defer signalReady(errClosed)
 	for h.ctx.Err() == nil {
 		err := h.stream(first, &token, signalReady)
 		if h.ctx.Err() != nil {
@@ -241,6 +292,7 @@ func (h *hub) run(first Timestamp) {
 			delete(h.m.hubs, h.db+"."+h.coll)
 			h.m.mu.Unlock()
 			h.failAll(err)
+			h.cancel() // release the hub context; nothing else will
 			return
 		}
 		var fatal *fatalError
@@ -276,8 +328,23 @@ func (h *hub) stream(first Timestamp, token *bsoncore.Document, ready func(error
 	if err != nil {
 		return err
 	}
+	// sctx ends with this stream (not only with the hub): otherwise every
+	// resume after a failover would leave one more goroutine parked on h.ctx
+	// until the hub itself shut down.
+	sctx, scancel := context.WithCancel(h.ctx)
+	defer scancel()
 	defer c.Close()
-	go func() { <-h.ctx.Done(); _ = c.Close() }()
+	go func() { <-sctx.Done(); _ = c.Close() }()
+	// A server-side change stream cursor outlives its connection (mongod only
+	// reaps it after the 10 minute cursor timeout), so every hub that ends -
+	// idle shutdown, server shutdown, a stream broken mid-way - would leave
+	// one behind. Kill it from a fresh connection on the way out.
+	var cursor int64
+	defer func() {
+		if cursor != 0 {
+			h.killCursor(cursor)
+		}
+	}()
 
 	mode := "required"
 	if h.coll == "" {
@@ -333,6 +400,7 @@ func (h *hub) stream(first Timestamp, token *bsoncore.Document, ready func(error
 		}
 		cur, _ := resp.Lookup("cursor").DocumentOK()
 		id, _ := cur.Lookup("id").AsInt64OK()
+		cursor = id
 		batch, _ := cur.Lookup("firstBatch").ArrayOK()
 		if batch == nil {
 			batch, _ = cur.Lookup("nextBatch").ArrayOK()
@@ -351,6 +419,23 @@ func (h *hub) stream(first Timestamp, token *bsoncore.Document, ready func(error
 		)
 		resp, err = m.Dial.RunCommand(c, h.db, next)
 	}
+}
+
+// killCursor best-effort kills the hub's upstream cursor on a fresh
+// connection (the stream's own may be closed or mid-getMore).
+func (h *hub) killCursor(id int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	c, err := h.m.Dial.Dial(ctx)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(3 * time.Second))
+	h.m.Dial.RunCommand(c, h.db, bsoncore.BuildDocument(nil,
+		bsoncore.AppendStringElement(nil, "killCursors", h.collName()),
+		bsoncore.AppendArrayElement(nil, "cursors", bsoncore.BuildArray(nil,
+			bsoncore.Value{Type: bsoncore.TypeInt64, Data: bsoncore.AppendInt64(nil, id)}))))
 }
 
 func appendElem(d bsoncore.Document, elem []byte) bsoncore.Document {
