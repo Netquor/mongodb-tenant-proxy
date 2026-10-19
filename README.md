@@ -349,4 +349,6 @@ go test ./test/ -count=1          # integration: real mongod replica set + offic
 go test ./test/ -bench FindOne -run xxx
 go test ./internal/proxy -bench RelayLargeBatch -benchmem -run xxx   # streaming vs buffered relay
 ```
+See [docs/security-testing.md](docs/security-testing.md) for the adversarial isolation suite (attack catalogue, differential testing, known limitations).
+
 Integration tests start their own `mongod` (must be on `PATH`) and cover isolation for CRUD, aggregation stages, cursors, bulk writes, transactions, indexes, and every auth mode (SCRAM-SHA-256/SHA-1, x.509 with generated certificates, OIDC/JWT, appname, static) including auth-enabled and TLS/x.509 upstreams, plus wire compression for each algorithm. `go test ./test/ -bench Compression -run xxx` compares compressors. The replica-set suite adds a 3-node set for topology discovery, tag/`maxStaleness` secondary reads, cursor affinity, transactions under pool contention, 80 clients multiplexed over a 4-connection pool, repeated `replSetStepDown` failovers with and without driver retries, a shutdown leak check, and dedicated mode.
