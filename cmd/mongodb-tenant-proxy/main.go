@@ -31,13 +31,9 @@ var (
 
 const usage = `usage:
   mongodb-tenant-proxy [serve] -config proxy.json [-listen :27018]
-<<<<<<< HEAD
-  mongodb-tenant-proxy hash-password -user NAME -tenant TENANT [-mechanism sha256|sha1|both]   (password read from $MTP_PASSWORD)
-=======
   mongodb-tenant-proxy version
   mongodb-tenant-proxy healthcheck [-config proxy.json | -url http://127.0.0.1:9102/healthz]
-  mongodb-tenant-proxy hash-password -user NAME -tenant TENANT   (password read from $MTP_PASSWORD or stdin prompt)
->>>>>>> refs/heads/operability
+  mongodb-tenant-proxy hash-password -user NAME -tenant TENANT [-mechanism sha256|sha1|both]   (password read from $MTP_PASSWORD)
   mongodb-tenant-proxy sign-appname -secret SECRET -tenant TENANT
 `
 
