@@ -189,6 +189,11 @@ func (r *atkRaw) write(b []byte) {
 	r.t.Helper()
 	r.nc.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if _, err := r.nc.Write(b); err != nil {
+		// The proxy may reject a hostile frame and hang up before it has read
+		// all of it; that is the behaviour under test, not a test failure.
+		if strings.Contains(err.Error(), "reset by peer") || strings.Contains(err.Error(), "broken pipe") {
+			return
+		}
 		r.t.Fatalf("write: %v", err)
 	}
 }

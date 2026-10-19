@@ -62,6 +62,7 @@ func TestStressReloadAdminChurn(t *testing.T) {
 	auditPath := filepath.Join(t.TempDir(), "audit.log")
 	e := setupOps(t, func(c *config.Config) {
 		c.Auth.Users = mkUsers()
+		c.Auth.BruteForce.MaxFailures = -1 // this test deliberately provokes auth failures from one address
 		c.Audit = config.Audit{Enabled: true, Sink: "file", Path: auditPath, SampleReads: 1}
 		c.Admin = config.Admin{Token: "0123456789abcdef-token"}
 	})
