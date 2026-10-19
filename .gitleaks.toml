@@ -1,0 +1,16 @@
+title = "mongodb-tenant-proxy gitleaks"
+
+[extend]
+useDefault = true
+
+# Test fixtures and docs carry deliberately fake credentials (SCRAM test users,
+# example admin tokens). Real secrets are never expected under these paths.
+[allowlist]
+description = "fake credentials in tests, examples and docs"
+paths = [
+  '''(^|/)[^/]*_test\.go$''',
+  '''^test/''',
+  '''^proxy\.example\.json$''',
+  '''^README\.md$''',
+  '''^deploy/.*\.(md|yml|yaml)$''',
+]

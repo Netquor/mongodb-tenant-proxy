@@ -3,7 +3,7 @@ package auth
 
 import (
 	"crypto/hmac"
-	"crypto/md5"
+	"crypto/md5" // #nosec G501 -- MD5 is mandated by the SCRAM-SHA-1 / MONGODB-CR password digest; see SECURITY.md
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -20,6 +20,8 @@ import (
 )
 
 // ErrAuthFailed is returned for any authentication failure.
+//
+//lint:ignore ST1005 the exact text (capitalised, with a full stop) is what MongoDB servers return, and drivers match it
 var ErrAuthFailed = errors.New("Authentication failed.")
 
 // SASL mechanism names.
@@ -390,7 +392,7 @@ func NewUser(username, tenant, password string) (config.User, error) {
 // SHA1Password is the legacy MONGODB-CR style digest SCRAM-SHA-1 is computed
 // from: hex(md5("<user>:mongo:<password>")).
 func SHA1Password(username, password string) string {
-	h := md5.Sum([]byte(username + ":mongo:" + password))
+	h := md5.Sum([]byte(username + ":mongo:" + password)) // #nosec G401 -- protocol-mandated SCRAM-SHA-1 digest (see SECURITY.md)
 	return hex.EncodeToString(h[:])
 }
 

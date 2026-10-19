@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"log/slog"
 	"strings"
 	"sync"
@@ -276,7 +277,7 @@ func (h *hub) stream(first Timestamp, token *bsoncore.Document, ready func(error
 		return err
 	}
 	defer c.Close()
-	go func() { <-h.ctx.Done(); c.Close() }()
+	go func() { <-h.ctx.Done(); _ = c.Close() }()
 
 	mode := "required"
 	if h.coll == "" {
@@ -358,7 +359,7 @@ func appendElem(d bsoncore.Document, elem []byte) bsoncore.Document {
 	out = append(out, elem...)
 	out = append(out, 0)
 	n := len(out)
-	out[0], out[1], out[2], out[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	safeconv.PutLen(out, n)
 	return out
 }
 
@@ -610,6 +611,6 @@ func (s *Sub) shape(ev bsoncore.Document) bsoncore.Document {
 	}
 	out = append(out, 0)
 	n := len(out)
-	out[0], out[1], out[2], out[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	safeconv.PutLen(out, n)
 	return out
 }

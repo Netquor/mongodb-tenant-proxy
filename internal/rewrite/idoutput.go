@@ -1,6 +1,7 @@
 package rewrite
 
 import (
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"strings"
 
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
@@ -267,7 +268,7 @@ func scrubDupKey(resp doc) doc {
 				b = bsoncore.AppendInt32Element(b, "index", int32(i))
 				if idx, ok := d.Lookup("index").AsInt64OK(); ok {
 					b = b[:4]
-					b = bsoncore.AppendInt32Element(b, "index", int32(idx))
+					b = bsoncore.AppendInt32Element(b, "index", safeconv.Sat32(idx))
 				}
 				b = bsoncore.AppendInt32Element(b, "code", 11000)
 				b = bsoncore.AppendStringElement(b, "errmsg", genericDupMsg)

@@ -173,7 +173,7 @@ func (r *compConn) roundTrip(cmd bson.D, comp wire.Compressor) (bsoncore.Documen
 	}
 	op, used := h.OpCode, wire.CompNone
 	if op == wire.OpCompressed {
-		op, used, rb, err = wire.Decompress(rb, 64<<20)
+		_, used, rb, err = wire.Decompress(rb, 64<<20)
 		must2(r.t, err)
 	}
 	m, err := wire.ParseMsg(rb)

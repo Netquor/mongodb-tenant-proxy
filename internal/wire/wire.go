@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"io"
 
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
@@ -48,10 +49,10 @@ func ReadFrame(r io.Reader, maxSize int) (Header, []byte, error) {
 		return Header{}, nil, err
 	}
 	h := Header{
-		Length:     int32(binary.LittleEndian.Uint32(hb[0:])),
-		RequestID:  int32(binary.LittleEndian.Uint32(hb[4:])),
-		ResponseTo: int32(binary.LittleEndian.Uint32(hb[8:])),
-		OpCode:     int32(binary.LittleEndian.Uint32(hb[12:])),
+		Length:     safeconv.I32(binary.LittleEndian.Uint32(hb[0:])),
+		RequestID:  safeconv.I32(binary.LittleEndian.Uint32(hb[4:])),
+		ResponseTo: safeconv.I32(binary.LittleEndian.Uint32(hb[8:])),
+		OpCode:     safeconv.I32(binary.LittleEndian.Uint32(hb[12:])),
 	}
 	if h.Length < headerSize {
 		return h, nil, fmt.Errorf("wire: invalid message length %d", h.Length)
@@ -69,10 +70,10 @@ func ReadFrame(r io.Reader, maxSize int) (Header, []byte, error) {
 // WriteFrame writes a message with the given header fields and body.
 func WriteFrame(w io.Writer, requestID, responseTo, opCode int32, body []byte) error {
 	buf := make([]byte, headerSize, headerSize+len(body))
-	binary.LittleEndian.PutUint32(buf[0:], uint32(headerSize+len(body)))
-	binary.LittleEndian.PutUint32(buf[4:], uint32(requestID))
-	binary.LittleEndian.PutUint32(buf[8:], uint32(responseTo))
-	binary.LittleEndian.PutUint32(buf[12:], uint32(opCode))
+	binary.LittleEndian.PutUint32(buf[0:], safeconv.Len32(headerSize+len(body)))
+	binary.LittleEndian.PutUint32(buf[4:], safeconv.U32(requestID))
+	binary.LittleEndian.PutUint32(buf[8:], safeconv.U32(responseTo))
+	binary.LittleEndian.PutUint32(buf[12:], safeconv.U32(opCode))
 	buf = append(buf, body...)
 	_, err := w.Write(buf)
 	return err
@@ -143,7 +144,7 @@ func ParseMsg(b []byte) (*Msg, error) {
 			if len(b) < 4 {
 				return nil, errors.New("wire: short kind-1 section")
 			}
-			size := int(int32(binary.LittleEndian.Uint32(b)))
+			size := int(safeconv.I32(binary.LittleEndian.Uint32(b)))
 			if size < 5 || size > len(b) {
 				return nil, errors.New("wire: invalid kind-1 section size")
 			}
@@ -192,7 +193,7 @@ func (m *Msg) Encode() []byte {
 			size += len(d)
 		}
 		out = append(out, 1)
-		out = binary.LittleEndian.AppendUint32(out, uint32(size))
+		out = binary.LittleEndian.AppendUint32(out, safeconv.Len32(size))
 		out = append(out, s.ID...)
 		out = append(out, 0)
 		for _, d := range s.Docs {
@@ -226,14 +227,14 @@ func ParseQuery(b []byte) (*Query, error) {
 	if len(b) < 4 {
 		return nil, errors.New("wire: short OP_QUERY")
 	}
-	q := &Query{Flags: int32(binary.LittleEndian.Uint32(b))}
+	q := &Query{Flags: safeconv.I32(binary.LittleEndian.Uint32(b))}
 	name, rest, ok := readCString(b[4:])
 	if !ok || len(rest) < 8 {
 		return nil, errors.New("wire: malformed OP_QUERY")
 	}
 	q.Collection = name
-	q.Skip = int32(binary.LittleEndian.Uint32(rest))
-	q.Return = int32(binary.LittleEndian.Uint32(rest[4:]))
+	q.Skip = safeconv.I32(binary.LittleEndian.Uint32(rest))
+	q.Return = safeconv.I32(binary.LittleEndian.Uint32(rest[4:]))
 	doc, _, ok := readDocument(rest[8:])
 	if !ok {
 		return nil, errors.New("wire: malformed OP_QUERY document")

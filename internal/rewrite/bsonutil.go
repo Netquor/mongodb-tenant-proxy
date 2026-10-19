@@ -2,6 +2,7 @@ package rewrite
 
 import (
 	"fmt"
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"github.com/netquor/mongodb-tenant-proxy/internal/wire"
 
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
@@ -117,7 +118,7 @@ func setField(d doc, key string, fn func(old *value) (value, bool, error)) (doc,
 // placeholder.
 func finishDoc(b []byte) doc {
 	b = append(b, 0)
-	b[0], b[1], b[2], b[3] = byte(len(b)), byte(len(b)>>8), byte(len(b)>>16), byte(len(b)>>24)
+	safeconv.PutLen(b, len(b))
 	return b
 }
 

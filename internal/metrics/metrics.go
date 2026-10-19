@@ -8,6 +8,7 @@ package metrics
 
 import (
 	"fmt"
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"hash/fnv"
 	"io"
 	"net/http"
@@ -385,7 +386,7 @@ func (r *Registry) Handler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 		r.write(w)
 	})
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "ok\n") })
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok\n") })
 	return mux
 }
 
@@ -432,8 +433,8 @@ func (l *labeler) label(id string) string {
 		return id
 	case "hash":
 		h := fnv.New32a()
-		h.Write([]byte(id))
-		return fmt.Sprintf("b%02d", h.Sum32()%uint32(l.buckets))
+		_, _ = h.Write([]byte(id)) // hash.Hash.Write never returns an error
+		return fmt.Sprintf("b%02d", h.Sum32()%safeconv.Len32(l.buckets))
 	}
 	if id == Unauthenticated || id == "other" {
 		return id

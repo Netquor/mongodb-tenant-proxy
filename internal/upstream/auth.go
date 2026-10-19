@@ -1,7 +1,7 @@
 package upstream
 
 import (
-	"crypto/md5"
+	"crypto/md5" // #nosec G501 -- MD5 is mandated by the SCRAM-SHA-1 / MONGODB-CR password digest; see SECURITY.md
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -24,7 +24,7 @@ func (d *Dialer) init() error {
 }
 
 func sha1Password(user, password string) string {
-	h := md5.Sum([]byte(user + ":mongo:" + password))
+	h := md5.Sum([]byte(user + ":mongo:" + password)) // #nosec G401 -- protocol-mandated SCRAM-SHA-1 digest (see SECURITY.md)
 	return hex.EncodeToString(h[:])
 }
 

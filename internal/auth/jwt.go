@@ -46,12 +46,24 @@ const (
 	maxJWKSBytes = 1 << 20
 )
 
+// jwksRedirect keeps a redirecting JWKS endpoint from downgrading to cleartext
+// or chaining indefinitely.
+func jwksRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 3 {
+		return errors.New("jwks fetch: too many redirects")
+	}
+	if via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+		return errors.New("jwks fetch: refusing https -> http redirect")
+	}
+	return nil
+}
+
 func newOIDCVerifier(c *config.OIDC) (*oidcVerifier, error) {
 	if c == nil {
 		return nil, errors.New("auth.oidc is required")
 	}
 	v := &oidcVerifier{cfg: *c, claim: c.TenantClaim, skew: 30 * time.Second, refresh: 10 * time.Minute,
-		client: &http.Client{Timeout: 10 * time.Second}}
+		client: &http.Client{Timeout: 10 * time.Second, CheckRedirect: jwksRedirect}}
 	if v.claim == "" {
 		v.claim = "tenant"
 	}
@@ -77,6 +89,7 @@ func (v *oidcVerifier) reload() error {
 		raw, err = os.ReadFile(v.cfg.JWKSFile)
 	} else {
 		var resp *http.Response
+		// #nosec G704 -- jwksUri is operator configuration (scheme-checked in config.Validate), never taken from a token
 		resp, err = v.client.Get(v.cfg.JWKSURI)
 		if err == nil {
 			defer resp.Body.Close()
@@ -139,8 +152,16 @@ func ParseJWKS(raw []byte) ([]jwkKey, error) {
 			if x == nil || y == nil {
 				continue
 			}
-			pub := &ecdsa.PublicKey{Curve: curve, X: x, Y: y}
-			if _, err := pub.ECDH(); err != nil { // validates the point is on the curve
+			size := (curve.Params().BitSize + 7) / 8
+			if x.BitLen() > size*8 || y.BitLen() > size*8 {
+				continue
+			}
+			pt := make([]byte, 1+2*size)
+			pt[0] = 4 // uncompressed point; ParseUncompressedPublicKey rejects points not on the curve
+			x.FillBytes(pt[1 : 1+size])
+			y.FillBytes(pt[1+size:])
+			pub, err := ecdsa.ParseUncompressedPublicKey(curve, pt)
+			if err != nil {
 				continue
 			}
 			out = append(out, jwkKey{k.Kid, pub})

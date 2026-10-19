@@ -69,7 +69,7 @@ func serve(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	path := fs.String("config", "", "path to JSON config file")
 	listen := fs.String("listen", "", "override listen address")
-	fs.Parse(args)
+	_ = fs.Parse(args) // FlagSet uses ExitOnError
 
 	cfg, err := config.Load(*path)
 	if err != nil {
@@ -145,7 +145,7 @@ func serve(args []string) error {
 	log.Info("listening", "addr", ln.Addr().String(), "auth", cfg.Auth.Mode, "tenantField", cfg.Tenant.Field, "version", version)
 	err = srv.Serve(ctx, ln)
 	for _, h := range hs {
-		h.Close()
+		_ = h.Close()
 	}
 	return err
 }
@@ -154,7 +154,7 @@ func healthcheck(args []string) error {
 	fs := flag.NewFlagSet("healthcheck", flag.ExitOnError)
 	path := fs.String("config", "", "config file to read metricsAddr from")
 	u := fs.String("url", os.Getenv("MTP_HEALTH_URL"), "health URL")
-	fs.Parse(args)
+	_ = fs.Parse(args) // FlagSet uses ExitOnError
 	if *u == "" {
 		addr := "127.0.0.1:9102"
 		if *path != "" {
@@ -177,11 +177,12 @@ func healthcheck(args []string) error {
 		*u = "http://" + net.JoinHostPort(host, port) + "/healthz"
 	}
 	c := &http.Client{Timeout: 3 * time.Second}
+	// #nosec G704 -- the URL is operator-supplied (flag/env) or built from the local metricsAddr; a healthcheck must probe it as given
 	resp, err := c.Get(*u)
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("unhealthy: %s", resp.Status)
 	}
@@ -193,7 +194,7 @@ func hashPassword(args []string) error {
 	user := fs.String("user", "", "username")
 	tenant := fs.String("tenant", "", "tenant id the user is bound to")
 	mech := fs.String("mechanism", "sha256", "credential to generate: sha256 (SCRAM-SHA-256), sha1 (SCRAM-SHA-1, legacy MD5 digest) or both")
-	fs.Parse(args)
+	_ = fs.Parse(args) // FlagSet uses ExitOnError
 	pw := os.Getenv("MTP_PASSWORD")
 	if pw == "" {
 		return fmt.Errorf("set MTP_PASSWORD in the environment")
@@ -229,7 +230,7 @@ func signAppName(args []string) error {
 	fs := flag.NewFlagSet("sign-appname", flag.ExitOnError)
 	secret := fs.String("secret", os.Getenv("MTP_APPNAME_SECRET"), "shared secret")
 	tenant := fs.String("tenant", "", "tenant id")
-	fs.Parse(args)
+	_ = fs.Parse(args) // FlagSet uses ExitOnError
 	if *secret == "" || *tenant == "" {
 		return fmt.Errorf("-secret and -tenant are required")
 	}

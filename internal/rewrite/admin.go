@@ -3,6 +3,7 @@ package rewrite
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"sort"
 	"strings"
 	"time"
@@ -52,7 +53,7 @@ func replyError(resp bsoncore.Document) error {
 	code, _ := resp.Lookup("code").AsInt64OK()
 	name, _ := resp.Lookup("codeName").StringValueOK()
 	msg, _ := resp.Lookup("errmsg").StringValueOK()
-	return &Error{Code: int32(code), CodeName: name, Msg: msg}
+	return &Error{Code: safeconv.Sat32(code), CodeName: name, Msg: msg}
 }
 
 func replyOKd(resp bsoncore.Document) bool {
@@ -97,7 +98,7 @@ func writeError(resp bsoncore.Document) error {
 	if code == 11000 {
 		name = "DuplicateKey"
 	}
-	return &Error{Code: int32(code), CodeName: name, Msg: msg}
+	return &Error{Code: safeconv.Sat32(code), CodeName: name, Msg: msg}
 }
 
 // runIgnoring is run, but a failed reply with one of the codes counts as success.
@@ -672,7 +673,7 @@ func (r *Rewriter) cmdDbStats(q *request) (*Result, error) {
 			avg = float64(dataSize) / float64(objs)
 		}
 		return buildDoc(
-			bStr("db", db), bI32("collections", int32(n)), bI32("views", int32(len(views))),
+			bStr("db", db), bI32("collections", safeconv.Sat32(n)), bI32("views", safeconv.Sat32(len(views))),
 			bI64("objects", objs), bsoncore.AppendDoubleElement(nil, "avgObjSize", avg),
 			bsoncore.AppendDoubleElement(nil, "dataSize", float64(dataSize)/float64(scale)),
 			bsoncore.AppendDoubleElement(nil, "storageSize", float64(storage)/float64(scale)),
@@ -717,7 +718,7 @@ func (r *Rewriter) cmdCollStats(q *request) (*Result, error) {
 		return buildDoc(
 			bStr("ns", db+"."+coll), bI64("size", sc(st.size)), bI64("count", st.count),
 			bI64("avgObjSize", avg), bI64("storageSize", sc(st.storage)),
-			bI32("nindexes", int32(st.nindexes)), bI64("totalIndexSize", sc(st.indexSize)),
+			bI32("nindexes", safeconv.Sat32(st.nindexes)), bI64("totalIndexSize", sc(st.indexSize)),
 			bDoc("indexSizes", finishDoc(isz)),
 			bI64("scaleFactor", scale), bBool("tenantScoped", true), bI32("ok", 1)), nil
 	}), nil
@@ -808,7 +809,7 @@ func (r *Rewriter) statsStage(q *request, stages []value) (*Result, error) {
 			}
 			out = appendRaw(out, bDoc("storageStats", buildDoc(
 				bI64("size", sc(st.size)), bI64("count", st.count), bI64("avgObjSize", avg),
-				bI64("storageSize", sc(st.storage)), bI32("nindexes", int32(st.nindexes)),
+				bI64("storageSize", sc(st.storage)), bI32("nindexes", safeconv.Sat32(st.nindexes)),
 				bI64("totalIndexSize", sc(st.indexSize)), bI64("scaleFactor", scale), bBool("tenantScoped", true))))
 		}
 		if wantCount {
@@ -829,7 +830,7 @@ func appendRaw(d doc, elem []byte) doc {
 
 func finishDocFull(b []byte) doc {
 	n := len(b)
-	b[0], b[1], b[2], b[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	safeconv.PutLen(b, n)
 	return b
 }
 
@@ -991,7 +992,7 @@ func (r *Rewriter) cmdServerStatus(q *request) (*Result, error) {
 			bStr("host", "mongodb-tenant-proxy"), bStr("version", version), bStr("process", "mongos"),
 			bI64("uptime", int64(up.Seconds())), bI64("uptimeMillis", up.Milliseconds()),
 			bsoncore.AppendDateTimeElement(nil, "localTime", time.Now().UnixMilli()),
-			bDoc("connections", buildDoc(bI32("current", int32(len(b.OwnClients()))))),
+			bDoc("connections", buildDoc(bI32("current", safeconv.Sat32(len(b.OwnClients()))))),
 			bI32("ok", 1)), nil
 	}), nil
 }

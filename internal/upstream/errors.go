@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"errors"
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"net"
 
 	"go.mongodb.org/mongo-driver/v2/x/bsonx/bsoncore"
@@ -78,11 +79,11 @@ func Status(resp bsoncore.Document) ReplyStatus {
 		st.OK = v == 1
 	}
 	if c, has := resp.Lookup("code").AsInt64OK(); has {
-		st.Code = int32(c)
+		st.Code = safeconv.Sat32(c)
 	}
 	if st.Code == 0 {
 		if c, has := resp.Lookup("writeConcernError", "code").AsInt64OK(); has {
-			st.Code = int32(c)
+			st.Code = safeconv.Sat32(c)
 		}
 	}
 	if st.Code == 0 {
@@ -90,8 +91,8 @@ func Status(resp bsoncore.Document) ReplyStatus {
 			vals, _ := arr.Values()
 			for _, v := range vals {
 				d, _ := v.DocumentOK()
-				if c, has := d.Lookup("code").AsInt64OK(); has && IsStateChange(int32(c)) {
-					st.Code = int32(c)
+				if c, has := d.Lookup("code").AsInt64OK(); has && IsStateChange(safeconv.Sat32(c)) {
+					st.Code = safeconv.Sat32(c)
 					break
 				}
 			}
@@ -155,6 +156,6 @@ func AddLabels(doc bsoncore.Document, labels ...string) bsoncore.Document {
 	out = bsoncore.AppendArrayElement(out, "errorLabels", bsoncore.BuildArray(nil, vals...))
 	out = append(out, 0)
 	n := len(out)
-	out[0], out[1], out[2], out[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	safeconv.PutLen(out, n)
 	return out
 }

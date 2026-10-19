@@ -663,8 +663,9 @@ func (t *topology) window(ms []*member) *member {
 			in = append(in, m)
 		}
 	}
+	// #nosec G404 -- power-of-two-choices load balancing; not security sensitive
 	a := in[rand.IntN(len(in))]
-	b := in[rand.IntN(len(in))]
+	b := in[rand.IntN(len(in))] // #nosec G404 -- see above
 	if b.inflight.Load() < a.inflight.Load() {
 		return b
 	}

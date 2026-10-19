@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"log/slog"
 	"net"
 	"os"
@@ -119,9 +120,10 @@ func NewDialer(cfg *config.Config) (*Dialer, error) {
 		if !on {
 			return nil, nil
 		}
+		// #nosec G402 -- InsecureSkipVerify is only true when the operator sets upstream.insecureSkipVerify (documented as testing-only); the default verifies
 		tc := &tls.Config{InsecureSkipVerify: skip, MinVersion: tls.VersionTLS12, ServerName: name}
 		if ca != "" {
-			pem, err := os.ReadFile(ca)
+			pem, err := os.ReadFile(ca) // #nosec G304 -- operator-configured CA path
 			if err != nil {
 				return nil, err
 			}
@@ -399,7 +401,7 @@ func appendDB(cmd bsoncore.Document, db string) bsoncore.Document {
 	out = bsoncore.AppendStringElement(out, "$db", db)
 	out = append(out, 0)
 	n := len(out)
-	out[0], out[1], out[2], out[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	safeconv.PutLen(out, n)
 	return out
 }
 

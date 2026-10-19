@@ -3,6 +3,7 @@ package proxy
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"strings"
 	"sync"
 	"time"
@@ -328,7 +329,7 @@ func appendRaw(d bsoncore.Document, elem []byte) bsoncore.Document {
 	out = append(out, elem...)
 	out = append(out, 0)
 	n := len(out)
-	out[0], out[1], out[2], out[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	safeconv.PutLen(out, n)
 	return out
 }
 
@@ -348,7 +349,7 @@ func withString(d bsoncore.Document, key, val string) bsoncore.Document {
 	}
 	out = append(out, 0)
 	n := len(out)
-	out[0], out[1], out[2], out[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	safeconv.PutLen(out, n)
 	return out
 }
 
@@ -373,7 +374,7 @@ func patchCursorNS(resp bsoncore.Document, ns string) bsoncore.Document {
 	}
 	out = append(out, 0)
 	n := len(out)
-	out[0], out[1], out[2], out[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	safeconv.PutLen(out, n)
 	return out
 }
 
@@ -462,7 +463,7 @@ func patchTop(d bsoncore.Document, key string, v bsoncore.Value) bsoncore.Docume
 	}
 	out = append(out, 0)
 	n := len(out)
-	out[0], out[1], out[2], out[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	safeconv.PutLen(out, n)
 	return out
 }
 
@@ -522,6 +523,6 @@ func (c *conn) ownValidator(entry bsoncore.Document, name string, own map[string
 	}
 	no = append(no, 0)
 	n := len(no)
-	no[0], no[1], no[2], no[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	safeconv.PutLen(no, n)
 	return patchTop(entry, "options", bsoncore.Value{Type: bsoncore.TypeEmbeddedDocument, Data: no})
 }

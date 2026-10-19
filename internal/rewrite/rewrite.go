@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"github.com/netquor/mongodb-tenant-proxy/internal/safeconv"
 	"strconv"
 	"strings"
 	"time"
@@ -642,7 +643,7 @@ func (r *Rewriter) ensureTenant(t *Tenant, d doc) (doc, error) {
 	out = bsoncore.AppendValueElement(out, r.field, t.Value)
 	out = append(out, 0)
 	n := len(out)
-	out[0], out[1], out[2], out[3] = byte(n), byte(n>>8), byte(n>>16), byte(n>>24)
+	safeconv.PutLen(out, n)
 	return out, nil
 }
 

@@ -92,7 +92,7 @@ func (h *HTTPSink) post(body []byte) {
 		}
 		resp, err := h.client.Do(req)
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode < 300 {
 				return
 			}

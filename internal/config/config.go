@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -398,7 +399,7 @@ type OIDC struct {
 func Load(path string) (*Config, error) {
 	c := &Config{Path: path}
 	if path != "" {
-		b, err := os.ReadFile(path)
+		b, err := os.ReadFile(path) // #nosec G304 -- the config path is the operator's -config argument
 		if err != nil {
 			return nil, err
 		}
@@ -778,6 +779,11 @@ func (c *Config) validateAuth() error {
 			if o == nil || o.Issuer == "" || o.Audience == "" || (o.JWKSFile == "") == (o.JWKSURI == "") {
 				return fmt.Errorf("auth.mode=oidc requires auth.oidc with issuer, audience and exactly one of jwksFile/jwksUri")
 			}
+			if o.JWKSURI != "" {
+				if err := checkJWKSURI(o.JWKSURI); err != nil {
+					return fmt.Errorf("auth.oidc.jwksUri: %w", err)
+				}
+			}
 			for _, d := range []string{o.JWKSRefresh, o.ClockSkew} {
 				if d != "" {
 					if _, err := time.ParseDuration(d); err != nil {
@@ -851,4 +857,28 @@ func (c *Config) ListenerTLS() (*tls.Config, error) {
 		return nil, nil
 	}
 	return c.ClientTLS.TLSConfig(c.Auth.Mode.Has("x509") && len(c.Auth.Mode.List()) == 1)
+}
+
+// checkJWKSURI requires https (plain http only to a loopback host, for local
+// identity providers and tests) and no embedded credentials, so the key set
+// that decides who may authenticate cannot be fetched or tampered with in
+// cleartext across a network.
+func checkJWKSURI(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return err
+	}
+	if u.Host == "" || u.User != nil {
+		return errors.New("must be an absolute URL without userinfo")
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if ip := net.ParseIP(u.Hostname()); (ip != nil && ip.IsLoopback()) || u.Hostname() == "localhost" {
+			return nil
+		}
+		return errors.New("http is only allowed for loopback hosts; use https")
+	}
+	return errors.New("scheme must be https")
 }
